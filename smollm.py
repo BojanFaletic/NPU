@@ -61,7 +61,7 @@ def empty_cache(cfg: Config) -> KVCache:
 
 
 class Layer:
-    __slots__ = ("wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down", "ln1", "ln2")
+    __slots__ = ("wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down", "ln1", "ln2", "npu")
 
     def __init__(self, sd: dict, i: int):
         p = f"model.layers.{i}."
@@ -74,6 +74,13 @@ class Layer:
         self.w_down = sd[p + "mlp.down_proj.weight"]
         self.ln1 = sd[p + "input_layernorm.weight"]
         self.ln2 = sd[p + "post_attention_layernorm.weight"]
+        self.npu: dict[str, object] | None = None  # filled by SmolLM when --npu
+
+    def _lin(self, name: str, x: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+        """F.linear(x, W) — routed through NPU if this layer has an NpuLinear."""
+        if self.npu is not None and name in self.npu:
+            return self.npu[name](x)
+        return F.linear(x, W)
 
     def forward(
         self,
@@ -87,9 +94,9 @@ class Layer:
         B, T, D = x.shape
         Hq, Hkv, Dh = cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
         h = rms_norm(x, self.ln1, cfg.rms_eps)
-        q = F.linear(h, self.wq).view(B, T, Hq,  Dh).transpose(1, 2)
-        k = F.linear(h, self.wk).view(B, T, Hkv, Dh).transpose(1, 2)
-        v = F.linear(h, self.wv).view(B, T, Hkv, Dh).transpose(1, 2)
+        q = self._lin("wq", h, self.wq).view(B, T, Hq,  Dh).transpose(1, 2)
+        k = self._lin("wk", h, self.wk).view(B, T, Hkv, Dh).transpose(1, 2)
+        v = self._lin("wv", h, self.wv).view(B, T, Hkv, Dh).transpose(1, 2)
         # RoPE uses absolute positions [start_pos, start_pos + T)
         q = apply_rope(q, cos[start_pos:start_pos + T], sin[start_pos:start_pos + T])
         k = apply_rope(k, cos[start_pos:start_pos + T], sin[start_pos:start_pos + T])
@@ -114,12 +121,12 @@ class Layer:
             att = att + mask
         att = F.softmax(att.float(), dim=-1).to(x.dtype)
         o = torch.matmul(att, v_exp).transpose(1, 2).contiguous().view(B, T, Hq * Dh)
-        x = x + F.linear(o, self.wo)
+        x = x + self._lin("wo", o, self.wo)
         # --- MLP (SwiGLU) ---
         h = rms_norm(x, self.ln2, cfg.rms_eps)
-        gate = F.silu(F.linear(h, self.w_gate))
-        up = F.linear(h, self.w_up)
-        x = x + F.linear(gate * up, self.w_down)
+        gate = F.silu(self._lin("w_gate", h, self.w_gate))
+        up = self._lin("w_up", h, self.w_up)
+        x = x + self._lin("w_down", gate * up, self.w_down)
         return x, new_cache
 
 
@@ -133,6 +140,20 @@ class SmolLM:
         dtype = self.embed.dtype
         device = self.embed.device
         self.cos, self.sin = build_rope_cache(cfg.head_dim, cfg.max_pos, cfg.rope_theta, dtype, device)
+
+    def enable_npu(self, ops: tuple[str, ...] = ("wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down")) -> None:
+        """Route the named linear ops through NpuLinear on every layer.
+
+        NpuLinear lazily compiles xclbins per (M, K, N) — first forward triggers
+        a burst of Peano/aiecc calls (~1-2s each). Weights are cast to bf16.
+        """
+        from npu.linear import NpuLinear  # local import to keep CPU path zero-cost
+        # One NpuLinear per (layer, op) since weights differ per layer.
+        for layer in self.layers:
+            layer.npu = {}
+            for op in ops:
+                W = getattr(layer, op)
+                layer.npu[op] = NpuLinear(W)
 
     def forward(
         self,
@@ -191,9 +212,14 @@ def main():
     p.add_argument("--check", action="store_true", help="compare logits vs HF")
     p.add_argument("--no-cache", action="store_true", help="disable KV cache (slow)")
     p.add_argument("--compare-cache", action="store_true", help="compare cache vs no-cache outputs")
+    p.add_argument("--npu", action="store_true",
+                   help="route matmuls through NPU (first call compiles, subsequent cached)")
     args = p.parse_args()
 
     model, tok, hf = load(torch.float32)
+    if args.npu:
+        print("enabling NPU backend for all MLP + attention projections…")
+        model.enable_npu()
     ids = tok(args.prompt, return_tensors="pt").input_ids
 
     if args.check:
