@@ -135,11 +135,16 @@ class NpuLinear:
 
     def __init__(self, weight: torch.Tensor):
         assert weight.dim() == 2, "expected [out, in]"
-        # Stash weight as contiguous bf16; transpose so dispatch matmul is A@B (not A@B.T)
         self.out_features, self.in_features = weight.shape
+        # bf16 weight, transposed so dispatched matmul is A @ B (not A @ B.T).
         self._W = weight.to(torch.bfloat16).t().contiguous()  # shape [in, out]
-        # pre-build one compiled xclbin per M we see; first init will be lazy
+        # Per-M compiled kernel + preallocated device buffers.
         self._compiled: dict[int, Compiled] = {}
+        # Per-M activation + output buffers; weight buffer is per-instance (one).
+        self._bo_a: dict[int, pyxrt.bo] = {}
+        self._bo_c: dict[int, pyxrt.bo] = {}
+        self._bo_b: dict[Path, pyxrt.bo] = {}        # keyed by xclbin path
+        self._B_pad_cache: dict[int, torch.Tensor] = {}  # padded B per N_pad
 
     def _plan_for(self, M: int) -> Compiled:
         if M not in self._compiled:
@@ -147,48 +152,66 @@ class NpuLinear:
             self._compiled[M] = _build_xclbin(plan)
         return self._compiled[M]
 
+    def _get_B_pad(self, N_pad: int) -> torch.Tensor:
+        cached = self._B_pad_cache.get(N_pad)
+        if cached is not None:
+            return cached
+        if N_pad != self.out_features:
+            B = torch.cat(
+                [self._W, torch.zeros(self.in_features, N_pad - self.out_features, dtype=torch.bfloat16)],
+                dim=1,
+            ).contiguous()
+        else:
+            B = self._W
+        self._B_pad_cache[N_pad] = B
+        return B
+
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
-        x2 = x.reshape(-1, self.in_features)  # [M, K]
+        x2 = x.reshape(-1, self.in_features)
         M = x2.shape[0]
         c = self._plan_for(M)
         plan = c.plan
 
-        # --- pad A to [M_pad, K] and B to [K, N_pad] (B padding done once) ---
+        dev = _XrtCtx.device()
+        _, _, kernel, bo_instr = _XrtCtx.kernel_for(c)
+
+        # --- weight buffer: upload once per xclbin, reused forever ---
+        bo_b = self._bo_b.get(c.xclbin_path)
+        if bo_b is None:
+            B_bf = self._get_B_pad(plan.N_pad)
+            b_np = _bf16_to_u16(B_bf).reshape(-1)
+            bo_b = pyxrt.bo(dev, b_np.nbytes, pyxrt.bo.host_only, kernel.group_id(4))
+            bo_b.write(b_np.tobytes(), 0)
+            bo_b.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            self._bo_b[c.xclbin_path] = bo_b
+
+        # --- activation + output buffers: one per M, reused across calls ---
+        bo_a = self._bo_a.get(M)
+        bo_c = self._bo_c.get(M)
+        if bo_a is None:
+            bo_a = pyxrt.bo(dev, plan.M_pad * plan.K * 2,    pyxrt.bo.host_only, kernel.group_id(3))
+            bo_c = pyxrt.bo(dev, plan.M_pad * plan.N_pad * 4, pyxrt.bo.host_only, kernel.group_id(5))
+            self._bo_a[M] = bo_a
+            self._bo_c[M] = bo_c
+
+        # --- pad A and upload ---
         A_bf = x2.to(torch.bfloat16).contiguous()
         if plan.M_pad != M:
             A_bf = torch.cat(
                 [A_bf, torch.zeros(plan.M_pad - M, plan.K, dtype=torch.bfloat16)], dim=0)
-        # B cache per-M only matters because N_pad depends only on N, not M — share once
-        if not hasattr(self, "_B_pad"):
-            if plan.N_pad != self.out_features:
-                self._B_pad = torch.cat(
-                    [self._W, torch.zeros(plan.K, plan.N_pad - self.out_features, dtype=torch.bfloat16)],
-                    dim=1,
-                ).contiguous()
-            else:
-                self._B_pad = self._W
-        B_bf = self._B_pad
+        a_np = _bf16_to_u16(A_bf).reshape(-1)
+        bo_a.write(a_np.tobytes(), 0)
+        bo_a.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
-        # --- move to device ---
-        dev = _XrtCtx.device()
-        _, _, kernel, bo_instr = _XrtCtx.kernel_for(c)
+        run = kernel(3, bo_instr, c.insts.size, bo_a, bo_b, bo_c)
+        run.wait()
 
-        a = _bf16_to_u16(A_bf).reshape(-1)
-        b = _bf16_to_u16(B_bf).reshape(-1)
-        bo_a = pyxrt.bo(dev, a.nbytes,                     pyxrt.bo.host_only, kernel.group_id(3))
-        bo_b = pyxrt.bo(dev, b.nbytes,                     pyxrt.bo.host_only, kernel.group_id(4))
-        bo_c = pyxrt.bo(dev, plan.M_pad * plan.N_pad * 4,  pyxrt.bo.host_only, kernel.group_id(5))
-        bo_a.write(a.tobytes(), 0); bo_a.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-        bo_b.write(b.tobytes(), 0); bo_b.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-
-        run = kernel(3, bo_instr, c.insts.size, bo_a, bo_b, bo_c); run.wait()
         bo_c.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
         c_out = np.frombuffer(bytes(bo_c.read(plan.M_pad * plan.N_pad * 4, 0)), dtype=np.float32)
         c_out = c_out.reshape(plan.M_pad, plan.N_pad)[:M, :self.out_features].copy()
 
-        out = torch.from_numpy(c_out)
-        return out.reshape(*orig_shape[:-1], self.out_features)
+        return torch.from_numpy(c_out).reshape(*orig_shape[:-1], self.out_features)
 
 
 # -------------------- self-test --------------------
