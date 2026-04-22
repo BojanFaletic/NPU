@@ -1,7 +1,7 @@
 [project]
 name = "npu"
 version = "0.1.0"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "torch",
     "transformers",
@@ -9,6 +9,7 @@ dependencies = [
     "huggingface-hub",
     "numpy",
     "mlir-aie",
+    "llvm-aie",
 ]
 
 [[tool.uv.index]]
@@ -19,3 +20,4 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
 mlir-aie = { url = "https://github.com/Xilinx/mlir-aie/releases/download/v1.3.1/mlir_aie-1.3.1-cp312-cp312-manylinux_2_35_x86_64.whl" }
+llvm-aie = { url = "https://github.com/Xilinx/llvm-aie/releases/download/nightly/llvm_aie-21.0.0.2026042201%2B24108bc9-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" }
