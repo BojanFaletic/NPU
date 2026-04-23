@@ -83,14 +83,19 @@ void attn_block(bfloat16 *restrict Q_with_header, bfloat16 *restrict KV) {
   bfloat16 *V = KV + BC * DH;
   const int start_col = g_block_idx * BC;
 
+  // S = Q · K^T · inv_sqrt_d. DH=64 splits into two 32-lane vector halves
+  // (512-bit is the native AIE vector width), each r/c pair: 2 loads per operand,
+  // 1 mul + 1 mac + reduce_add. 1024 vector ops total vs 65K scalar.
   alignas(64) float S[BR * BC];
   for (int r = 0; r < BR; ++r) {
+    aie::vector<bfloat16, 32> q0 = aie::load_v<32>(&Q[r * DH]);
+    aie::vector<bfloat16, 32> q1 = aie::load_v<32>(&Q[r * DH + 32]);
     for (int c = 0; c < BC; ++c) {
-      float acc = 0.0f;
-      for (int k = 0; k < DH; ++k) {
-        acc += (float)Q[r * DH + k] * (float)K[c * DH + k];
-      }
-      S[r * BC + c] = acc * INV_SQRT_D;
+      aie::vector<bfloat16, 32> k0 = aie::load_v<32>(&K[c * DH]);
+      aie::vector<bfloat16, 32> k1 = aie::load_v<32>(&K[c * DH + 32]);
+      aie::accum<accfloat, 32> acc = aie::mul(q0, k0);
+      acc = aie::mac(acc, q1, k1);
+      S[r * BC + c] = aie::reduce_add(acc.to_vector<float>()) * INV_SQRT_D;
     }
   }
 
@@ -123,22 +128,33 @@ void attn_block(bfloat16 *restrict Q_with_header, bfloat16 *restrict KV) {
 
     float alpha = (m_prev == -INFINITY) ? 0.0f : exp_scalar(m_prev - m_new);
 
-    float P_row[BC];
+    // P_row = exp(S[r, :] - m_new). Keep both bf16 (for the S·V vector MAC)
+    // and a running fp32 sum for l[r].
+    alignas(64) bfloat16 P_row[BC];
     float row_sum = 0.0f;
     for (int c = 0; c < BC; ++c) {
       float e = exp_scalar(S[r * BC + c] - m_new);
-      P_row[c] = e;
+      P_row[c] = (bfloat16)e;
       row_sum += e;
     }
     g_l[r] = alpha * g_l[r] + row_sum;
 
-    for (int d = 0; d < DH; ++d) {
-      float o = alpha * (float)g_O[r * DH + d];
-      for (int c = 0; c < BC; ++c) {
-        o += P_row[c] * (float)V[c * DH + d];
-      }
-      g_O[r * DH + d] = (bfloat16)o;
+    // O[r, :] = alpha · O[r, :] + P_row @ V. Output row spans DH=64 lanes,
+    // split into two 32-lane halves. alpha scales the prior O accumulator
+    // via a vector mul; each P_row[c] is then a bf16 scalar broadcast-MAC
+    // against one row of V (both halves).
+    const bfloat16 alpha_bf = (bfloat16)alpha;
+    aie::accum<accfloat, 32> o0 = aie::mul(aie::load_v<32>(&g_O[r * DH]),       alpha_bf);
+    aie::accum<accfloat, 32> o1 = aie::mul(aie::load_v<32>(&g_O[r * DH + 32]), alpha_bf);
+    for (int c = 0; c < BC; ++c) {
+      aie::vector<bfloat16, 32> v0 = aie::load_v<32>(&V[c * DH]);
+      aie::vector<bfloat16, 32> v1 = aie::load_v<32>(&V[c * DH + 32]);
+      o0 = aie::mac(o0, v0, P_row[c]);
+      o1 = aie::mac(o1, v1, P_row[c]);
     }
+    aie::store_v(&g_O[r * DH],      o0.to_vector<bfloat16>());
+    aie::store_v(&g_O[r * DH + 32], o1.to_vector<bfloat16>());
+
     g_m[r] = m_new;
   }
 
