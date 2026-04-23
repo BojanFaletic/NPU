@@ -86,17 +86,18 @@ class Layer:
         self, q, k_exp, v_exp, start_pos: int,
         B: int, T: int, Tk: int, Hq: int, Dh: int,
     ) -> torch.Tensor:
-        """Run NPU FlashAttention per (batch, head, Q-block); return `o` [B, T, Hq*Dh].
+        """Run NPU FlashAttention for one whole layer in a single dispatch,
+        batching all (B, Hq, Q-block) combinations.
 
-        Pads T up to multiple of BR and Tk up to multiple of BC. Causal mask
-        inside the kernel handles both the real causal boundary and the padded
-        lanes (padded K cols at positions >= Tk are past every real Q row's
-        causal frontier).
+        Pads T to multiple of BR and Tk to multiple of BC. Padded K cols sit
+        past every real Q row's causal frontier, so the in-kernel causal mask
+        handles them naturally.
         """
         attn = self.npu["attention"]
         BR, BC = attn.BR, attn.BC
         Tq_pad = ((T  + BR - 1) // BR) * BR
         Tk_pad = ((Tk + BC - 1) // BC) * BC
+        n_q = Tq_pad // BR
 
         if Tq_pad > T:
             q = torch.cat([q, q.new_zeros(B, Hq, Tq_pad - T, Dh)], dim=2)
@@ -104,18 +105,18 @@ class Layer:
             k_exp = torch.cat([k_exp, k_exp.new_zeros(B, Hq, Tk_pad - Tk, Dh)], dim=2)
             v_exp = torch.cat([v_exp, v_exp.new_zeros(B, Hq, Tk_pad - Tk, Dh)], dim=2)
 
-        O_pad = q.new_zeros(B, Hq, Tq_pad, Dh)
-        for b in range(B):
-            for h in range(Hq):
-                Kh = k_exp[b, h].contiguous()
-                Vh = v_exp[b, h].contiguous()
-                for i in range(Tq_pad // BR):
-                    Qi = q[b, h, i*BR:(i+1)*BR].contiguous()
-                    O_pad[b, h, i*BR:(i+1)*BR] = attn.run_one(
-                        Qi, Kh, Vh,
-                        start_row=i * BR + start_pos,
-                        causal=True,
-                    ).float()
+        # Reshape into a flat [N, BR, D] Q stack with matching [N, Tk_pad, D]
+        # K and V stacks. K/V are duplicated across the n_q Q-blocks of the
+        # same (batch, head) to keep the kernel path simple (one KV stream
+        # per Q-block). Cheap DMA relative to what we save on dispatches.
+        N = B * Hq * n_q
+        q_stack = q.view(B, Hq, n_q, BR, Dh).reshape(N, BR, Dh).contiguous()
+        k_stack = k_exp.unsqueeze(2).expand(B, Hq, n_q, Tk_pad, Dh).reshape(N, Tk_pad, Dh).contiguous()
+        v_stack = v_exp.unsqueeze(2).expand(B, Hq, n_q, Tk_pad, Dh).reshape(N, Tk_pad, Dh).contiguous()
+        start_rows = [i * BR + start_pos for _ in range(B * Hq) for i in range(n_q)]
+
+        O_stack = attn.run_batch(q_stack, k_stack, v_stack, start_rows, causal=True).float()
+        O_pad = O_stack.view(B, Hq, n_q, BR, Dh).reshape(B, Hq, Tq_pad, Dh)
 
         return O_pad[:, :, :T, :].transpose(1, 2).contiguous().view(B, T, Hq * Dh)
 

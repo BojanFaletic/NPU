@@ -43,14 +43,14 @@ the end goal is Qwen3-27B/32B running efficiently on the same laptop.
   tile memory so the [BR, TK] intermediate never materialises. Causal
   mask supported via a tiny header in the Q buffer (`start_row` +
   `causal` flag). Tested TK up to 512 with causal, max|Δ|≈4.7e-2.
-- **SmolLM integration**: `smollm.py --npu` enables FA for prefill (T>1),
-  dispatching once per (head, Q-block). **Top-1 matches HF exactly** on
-  tested prompts. Per-dispatch matmuls are vectorised (32-lane bf16
-  load + mul/mac + reduce_add, two halves for DH=64). Still 8-13× slower
-  than CPU because each forward pass issues 270-1080 small dispatches
-  and we're at the ~1.5 ms per-dispatch floor (PCIe upload + Python
-  torch.cat + kernel invoke). The outstanding lever is per-layer head
-  batching so one dispatch per layer handles all H×n_q Q-blocks.
+- **SmolLM integration**: `smollm.py --npu` enables FA for prefill (T>1).
+  One dispatch per layer batches all Hq × n_q Q-blocks; inside the kernel
+  the Q·K^T and S·V matmuls are vectorised (32-lane bf16 load + mul/mac
+  + reduce_add, two halves for DH=64). **Top-1 matches HF exactly** on
+  tested prompts. End-to-end prefill currently 8-12× slower than CPU
+  (T=32: 409 ms vs 48 ms; T=128: 1400 ms vs 120 ms) — remaining bottle­
+  necks are the scalar `exp_scalar` broadcast waste, the CPU loop inside
+  the per-row softmax update, and single-core compute (4 cores idle).
 - **Benchmarks** — at short prefill lengths NPU is still **slower** than CPU
   (~0.2× at L=16, ~0.9× at L=2048), fixed per-op dispatch overhead dominates.
   Useful prefill win starts needing less driver-Python overhead per op.

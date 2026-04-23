@@ -46,12 +46,14 @@ def compile_kernel(BR: int, BC: int, D: int, build_dir: Path) -> Path:
 HEADER_BF16 = 32  # matches fa_kernel.cc; header riding in Q buffer
 
 
-def generate_mlir(BR: int, BC: int, D: int, n_kv: int, obj_name: str, out_path: Path) -> None:
-    """Two input FIFOs (Q+header once + KV-pairs streamed n_kv times) -> O.
+def generate_mlir(BR: int, BC: int, D: int, n_kv: int, n_q_total: int,
+                  obj_name: str, out_path: Path) -> None:
+    """Two input FIFOs (Q+header stream, KV-pair stream) -> O stream. One
+    dispatch processes n_q_total Q-blocks (amortises host-side dispatch
+    overhead across all heads × Q-blocks in a layer).
 
-    Compute tiles have a 2-input DMA channel limit, so Q carries start_row and
-    the causal flag inline in its first 32 bf16 lanes, and K/V are paired into
-    one streaming FIFO (each tile is [K | V] concatenated, 2·BC·D bf16).
+    Q carries start_row + causal flag inline; compute tiles have a 2-input
+    DMA channel limit so K and V are paired into one streaming FIFO.
     """
     from ml_dtypes import bfloat16 as np_bf16
     from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
@@ -66,7 +68,9 @@ def generate_mlir(BR: int, BC: int, D: int, n_kv: int, obj_name: str, out_path: 
     q_ty  = np.ndarray[(q_len,),  np.dtype[np_bf16]]
     kv_ty = np.ndarray[(kv_len,), np.dtype[np_bf16]]
     o_ty  = np.ndarray[(o_len,),  np.dtype[np_bf16]]
-    kv_stream_ty = np.ndarray[(n_kv * kv_len,), np.dtype[np_bf16]]
+    q_stream_ty  = np.ndarray[(n_q_total * q_len,),         np.dtype[np_bf16]]
+    kv_stream_ty = np.ndarray[(n_q_total * n_kv * kv_len,), np.dtype[np_bf16]]
+    o_stream_ty  = np.ndarray[(n_q_total * o_len,),         np.dtype[np_bf16]]
 
     block_k    = Kernel("attn_block",    obj_name, [q_ty, kv_ty])
     finalise_k = Kernel("attn_finalise", obj_name, [o_ty])
@@ -76,25 +80,26 @@ def generate_mlir(BR: int, BC: int, D: int, n_kv: int, obj_name: str, out_path: 
     fifo_o  = ObjectFifo(o_ty,  name="outO")
 
     def core_fn(of_q, of_kv, of_o, attn_block, attn_finalise):
-        elem_o = of_o.acquire(1)
-        elem_q = of_q.acquire(1)
-        for _ in range_(n_kv) if n_kv > 1 else range(1):
-            elem_kv = of_kv.acquire(1)
-            attn_block(elem_q, elem_kv)
-            of_kv.release(1)
-        attn_finalise(elem_o)
-        of_q.release(1)
-        of_o.release(1)
+        for _ in range_(n_q_total) if n_q_total > 1 else range(1):
+            elem_o = of_o.acquire(1)
+            elem_q = of_q.acquire(1)
+            for _ in range_(n_kv) if n_kv > 1 else range(1):
+                elem_kv = of_kv.acquire(1)
+                attn_block(elem_q, elem_kv)
+                of_kv.release(1)
+            attn_finalise(elem_o)
+            of_q.release(1)
+            of_o.release(1)
 
     worker = Worker(
         core_fn,
         fn_args=[fifo_q.cons(), fifo_kv.cons(), fifo_o.prod(), block_k, finalise_k],
-        # g_O[BR*DH] fp32 = 8KB static + S[BR*BC] fp32 = 4KB stack + call frames
+        # g_O[BR*DH] bf16 = 4KB + g_m/g_l = 256B + S[BR*BC] fp32 = 4KB stack
         stack_size=0x3000,
     )
 
     rt = Runtime()
-    with rt.sequence(q_ty, kv_stream_ty, o_ty) as (q, kv, o):
+    with rt.sequence(q_stream_ty, kv_stream_ty, o_stream_ty) as (q, kv, o):
         rt.start(worker)
         rt.fill(fifo_q.prod(),  q)
         rt.fill(fifo_kv.prod(), kv)
@@ -106,13 +111,13 @@ def generate_mlir(BR: int, BC: int, D: int, n_kv: int, obj_name: str, out_path: 
 
 @dataclass
 class Compiled:
-    BR: int; BC: int; D: int; n_kv: int
+    BR: int; BC: int; D: int; n_kv: int; n_q_total: int
     xclbin_path: Path
     insts: np.ndarray
 
 
-def build_xclbin(BR: int, BC: int, D: int, n_kv: int) -> Compiled:
-    tag = f"fa_{BR}x{BC}x{D}_n{n_kv}"
+def build_xclbin(BR: int, BC: int, D: int, n_kv: int, n_q_total: int) -> Compiled:
+    tag = f"fa_{BR}x{BC}x{D}_n{n_kv}_q{n_q_total}"
     build = CACHE / tag
     build.mkdir(parents=True, exist_ok=True)
     xclbin = build / "final.xclbin"
@@ -120,22 +125,24 @@ def build_xclbin(BR: int, BC: int, D: int, n_kv: int) -> Compiled:
     if not xclbin.exists() or not insts.exists():
         obj = compile_kernel(BR, BC, D, build)
         mlir = build / "aie.mlir"
-        generate_mlir(BR, BC, D, n_kv, obj.name, mlir)
+        generate_mlir(BR, BC, D, n_kv, n_q_total, obj.name, mlir)
         compile_xclbin(mlir, obj, build)
     insts_arr = np.fromfile(insts, dtype=np.uint32)
-    return Compiled(BR=BR, BC=BC, D=D, n_kv=n_kv, xclbin_path=xclbin, insts=insts_arr)
+    return Compiled(BR=BR, BC=BC, D=D, n_kv=n_kv, n_q_total=n_q_total,
+                    xclbin_path=xclbin, insts=insts_arr)
 
 
 class NpuAttention:
-    """(Q, K, V) -> O for one head, one Q block.
+    """Callable that runs FA on a batch of Q-blocks in one NPU dispatch.
 
-    Q: [BR, D], K/V: [n_kv*BC, D]. D and BR hard-coded against the xclbin
-    shape (recompile for new dims). n_kv is inferred from TK/BC.
+    Batching across Q-blocks amortises dispatch overhead (PCIe upload +
+    Python marshalling + kernel invoke). xclbins are keyed on (n_kv, n_q)
+    so a full prefill reuses the same xclbin across layers.
     """
     def __init__(self, BR: int = 32, BC: int = 32, D: int = 64):
         self.BR, self.BC, self.D = BR, BC, D
-        self._compiled: dict[int, Compiled] = {}   # keyed by n_kv
-        self._bo: dict[int, tuple] = {}
+        self._compiled: dict[tuple[int, int], Compiled] = {}   # (n_kv, n_q_total)
+        self._bo: dict[tuple[int, int], tuple] = {}
         self._kernel_cache: dict[Path, tuple] = {}
         self._device = None
 
@@ -162,58 +169,62 @@ class NpuAttention:
         self._kernel_cache[c.xclbin_path] = (xb, ctx, kernel, bo_instr)
         return self._kernel_cache[c.xclbin_path]
 
-    def run_one(
-        self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
-        start_row: int = 0, causal: bool = False,
+    def run_batch(
+        self,
+        Q_stack: torch.Tensor,     # [N, BR, D]
+        K_stack: torch.Tensor,     # [N, TK, D] — per-Q-block K (dup across Q-blocks of same head)
+        V_stack: torch.Tensor,     # [N, TK, D]
+        start_rows: list[int],     # length N
+        causal: bool = True,
     ) -> torch.Tensor:
-        """Q [BR, D], K [TK, D], V [TK, D], TK multiple of BC. Returns O [BR, D] bf16.
-
-        start_row is the absolute position of Q row 0 in the full sequence; it
-        drives the causal mask alongside the block index. Used when Tq > BR and
-        this call is handling a middle Q block (rows start_row..start_row+BR-1).
-        """
+        """Return O_stack [N, BR, D] bf16. TK must be a multiple of BC."""
         import pyxrt
-        BR, D = Q.shape
-        TK = K.shape[0]
+        N, BR, D = Q_stack.shape
+        TK = K_stack.shape[1]
         BC = self.BC
-        assert (BR, D) == (self.BR, self.D), f"Q shape {Q.shape} != ({self.BR}, {self.D})"
-        assert K.shape == (TK, D) and V.shape == (TK, D)
-        assert TK % BC == 0, f"TK={TK} not a multiple of BC={BC}"
+        assert (BR, D) == (self.BR, self.D)
+        assert K_stack.shape == (N, TK, D) and V_stack.shape == (N, TK, D)
+        assert TK % BC == 0
+        assert len(start_rows) == N
         n_kv = TK // BC
 
-        if n_kv not in self._compiled:
-            self._compiled[n_kv] = build_xclbin(BR, BC, D, n_kv)
-        c = self._compiled[n_kv]
+        key = (n_kv, N)
+        if key not in self._compiled:
+            self._compiled[key] = build_xclbin(BR, BC, D, n_kv, N)
+        c = self._compiled[key]
         dev = self._device_obj()
         _, _, kernel, bo_instr = self._kernel_for(c)
 
-        q_bytes  = (HEADER_BF16 + BR * D) * 2  # header + Q data, bf16
-        kv_bytes = n_kv * 2 * BC * D * 2
-        o_bytes  = BR * D * 2
-        if n_kv not in self._bo:
+        q_tile_len  = HEADER_BF16 + BR * D
+        kv_tile_len = 2 * BC * D
+        o_tile_len  = BR * D
+        q_bytes  = N * q_tile_len * 2
+        kv_bytes = N * n_kv * kv_tile_len * 2
+        o_bytes  = N * o_tile_len * 2
+        if key not in self._bo:
             bo_q  = pyxrt.bo(dev, q_bytes,  pyxrt.bo.host_only, kernel.group_id(3))
             bo_kv = pyxrt.bo(dev, kv_bytes, pyxrt.bo.host_only, kernel.group_id(4))
             bo_o  = pyxrt.bo(dev, o_bytes,  pyxrt.bo.host_only, kernel.group_id(5))
-            self._bo[n_kv] = (bo_q, bo_kv, bo_o)
-        bo_q, bo_kv, bo_o = self._bo[n_kv]
+            self._bo[key] = (bo_q, bo_kv, bo_o)
+        bo_q, bo_kv, bo_o = self._bo[key]
 
-        # Q buffer = header (start_row, causal, padding) + Q data
-        header = torch.zeros(HEADER_BF16, dtype=torch.bfloat16)
-        header[0] = float(start_row)
-        header[1] = 1.0 if causal else 0.0
-        q_payload = torch.cat([header, Q.to(torch.bfloat16).contiguous().reshape(-1)])
-        q_arr = _bf16_to_u16(q_payload).reshape(-1)
+        # Build Q buffer: N tiles of [header || Q_block]. Assemble as a flat
+        # bf16 tensor in one shot and pay one torch.cat.
+        Q_bf = Q_stack.to(torch.bfloat16).contiguous()  # [N, BR, D]
+        headers = torch.zeros((N, HEADER_BF16), dtype=torch.bfloat16)
+        headers[:, 0] = torch.tensor(start_rows, dtype=torch.bfloat16)
+        headers[:, 1] = 1.0 if causal else 0.0
+        q_tiles = torch.cat([headers, Q_bf.reshape(N, -1)], dim=1)  # [N, q_tile_len]
+        q_arr = _bf16_to_u16(q_tiles.reshape(-1)).reshape(-1)
         bo_q.write(q_arr.tobytes(), 0)
         bo_q.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
-        K_bf = K.to(torch.bfloat16).contiguous()
-        V_bf = V.to(torch.bfloat16).contiguous()
-        kv_blocks = []
-        for j in range(n_kv):
-            kv_blocks.append(K_bf[j*BC:(j+1)*BC].reshape(-1))
-            kv_blocks.append(V_bf[j*BC:(j+1)*BC].reshape(-1))
-        kv = torch.cat(kv_blocks)
-        kv_arr = _bf16_to_u16(kv).reshape(-1)
+        # Build KV buffer: for each Q-block, stream n_kv (K_block, V_block) pairs.
+        # Shape plan: [N, n_kv, 2, BC, D] → flatten.
+        K_bf = K_stack.to(torch.bfloat16).contiguous().view(N, n_kv, BC, D)
+        V_bf = V_stack.to(torch.bfloat16).contiguous().view(N, n_kv, BC, D)
+        kv_stream = torch.stack([K_bf, V_bf], dim=2)  # [N, n_kv, 2, BC, D]
+        kv_arr = _bf16_to_u16(kv_stream.reshape(-1)).reshape(-1)
         bo_kv.write(kv_arr.tobytes(), 0)
         bo_kv.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
@@ -222,7 +233,16 @@ class NpuAttention:
 
         bo_o.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
         out = np.frombuffer(bytes(bo_o.read(o_bytes, 0)), dtype=np.uint16).copy()
-        return torch.from_numpy(out).view(torch.bfloat16).reshape(BR, D)
+        return torch.from_numpy(out).view(torch.bfloat16).reshape(N, BR, D)
+
+    def run_one(
+        self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
+        start_row: int = 0, causal: bool = False,
+    ) -> torch.Tensor:
+        """Single-Q-block wrapper around run_batch (kept for the self-test)."""
+        O = self.run_batch(Q.unsqueeze(0), K.unsqueeze(0), V.unsqueeze(0),
+                           [start_row], causal=causal)
+        return O.squeeze(0)
 
 
 # -------------------- self-test --------------------
