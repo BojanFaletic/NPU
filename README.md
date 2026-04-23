@@ -36,13 +36,15 @@ the end goal is Qwen3-27B/32B running efficiently on the same laptop.
   context-switching between `NpuLinear` and `NpuSoftmax` at every layer. The
   fix is FA-style fusion (softmax inside the matmul xclbin), not more softmax
   tuning.
-- **FlashAttention work-in-progress** (`npu/fa_ref.py`, `npu/fa_kernel.cc`) —
-  Python FA-2 reference (block streaming + online softmax) verified against
-  torch attention to fp32 rounding across square, tail-block, and decode
-  (Tq<Tk) shapes. AIE2p C++ kernel skeleton with Br=32, Bc=64, D=64 tile
-  sizes (36.5 KB of 64 KB tile DMEM), function signatures for the 4
-  inner-loop pieces, and the online-softmax outer shell. Inner bodies are
-  flagged TODO — next session's work.
+- **Fused attention on NPU** (`npu/fa.py`, `npu/fa_kernel.cc`) — single
+  compute tile runs `softmax(Q·K^T / √D)·V` in one dispatch, Q/K/V packed
+  into one input buffer (compute tiles have a 2 input DMA channel limit on
+  AIE2p). Scalar matmuls in/out of the stock per-row `softmax_simple_bf16`.
+  Working and tested at TQ=TK=32, D=64 — 10/10 trials match torch attention
+  to bf16 precision (max|Δ|≈3-5e-2, mean|Δ|≈5e-3). Bigger shapes need
+  streaming (the 64×64 ObjectFifo doesn't fit in tile DMEM) — that's the
+  next step toward true FA with online rescaling. `npu/fa_ref.py` is the
+  Python block-streaming reference (matches torch to fp32 rounding).
 - **Benchmarks** — at short prefill lengths NPU is still **slower** than CPU
   (~0.2× at L=16, ~0.9× at L=2048), fixed per-op dispatch overhead dominates.
   Useful prefill win starts needing less driver-Python overhead per op.
@@ -65,11 +67,13 @@ npu/
   softmax.py        — NpuSoftmax: per-row bf16 softmax + IRON program +
                       standalone self-test
   bench_softmax.py  — standalone softmax throughput bench (NPU vs CPU)
-  fa_ref.py         — FlashAttention-2 forward-pass reference in Python,
-                      bit-matches torch attention; correctness contract for
-                      the AIE kernel
-  fa_kernel.cc      — AIE2p FA kernel skeleton (tile sizes + signatures,
-                      inner loops TODO)
+  fa_ref.py         — FlashAttention-2 forward-pass reference in Python
+                      (block streaming + online softmax); bit-matches torch
+                      attention to fp32 rounding
+  fa_kernel.cc      — AIE2p fused-attention kernel: scalar Q·K^T, stock
+                      per-row softmax, scalar P·V. One dispatch = one head
+                      of attention.
+  fa.py             — NpuAttention dispatch wrapper + self-test
   verify_layer.py   — compares NPU Q-projection output vs CPU inside one layer
   build/            — generated xclbins and object files (gitignored)
 vendor/             — gitignored
@@ -132,27 +136,27 @@ uv run python npu/matmul_mc.py -M 512 -K 512 -N 512 -m 32 -k 64 -n 32 --cols 4
   i.e. `M % (m·8) == 0` for the default tb layout. `NpuLinear.Plan` pads
   accordingly (minimum M_pad = 256 with `m=32`).
 
-## Next session — implement the FA kernel
+## Next session — scale FA kernel up
 
-Design + Python reference + skeleton are in place. `npu/fa_kernel.cc` has the
-outer shell (online-softmax state + block loop) wired up and tile sizes
-(Br=32, Bc=64, D=64) chosen to fit tile DMEM and hit the native bf16 mac
-(4,8,8). Four TODOs remain, in order of dependency:
+Single-block fused attention works at TQ=TK=32, D=64. To use this on SmolLM2
+prefill (needs T up to hundreds of tokens), the kernel has to stream K/V
+blocks through a fixed-size Q block with online softmax rescaling — the
+actual FlashAttention algorithm. The Python reference for that already
+exists (`npu/fa_ref.py`, block streaming + online softmax, bit-matches
+torch to fp32 rounding).
 
-1. `matmul_Q_Kt` — `S = Q @ K^T / sqrt(D)` with optional causal mask. Adapt
-   `aie_kernels/aie2p/mm.cc`. Cheapest first test: set `causal=false`, verify
-   `S` values bit-match a CPU oracle.
-2. `online_softmax_update` — rowmax, `exp2`, rescale, rowsum, broadcast-rescale
-   of `O`. All idioms exist in `aie_kernels/aie2p/softmax.cc`; this adapts
-   them to per-row and to the online accumulator pattern.
-3. `matmul_P_V_accum` — same matmul as (1), accumulating into the f32 O tile
-   instead of zeroing.
-4. `finalise` — broadcast divide + cast to bf16. Guard `l==0` rows.
+Work order:
+1. Convert the C++ kernel from "one block, T² on-chip" to "stream K/V blocks
+   with online softmax stats (m, l) and output rescaling". This is where the
+   kernel graduates from "fused attention" to "FA".
+2. Add causal masking in the Q·K^T step (positions `c > r + start_pos` set
+   to -inf pre-softmax).
+3. IRON orchestration: loop K/V blocks via a second ObjectFifo streaming
+   through the compute tile, so the tile only holds one (Qi, Kj, Vj) at a
+   time — memory budget drops from O(T²) to O(Br·D + Bc·D).
+4. Multi-core split: SmolLM2 has Hq=9 heads, trivial to partition across 4
+   compute cores (3+2+2+2). Needed for end-to-end throughput to beat CPU.
+5. Wire into `smollm.py` attention body, verify top-1 matches HF + bench.
 
-Then: write `npu/fa.py` (IRON orchestration + pyxrt dispatch, modeled on
-`npu/linear.py`), wire into `smollm.py` attention (replace `Q·K^T`, softmax,
-and `att·V` with a single call), verify top-1 matches HF and bench.
-
-After FA works: multi-core split by head (9 heads → 4 cores = 3+2+2+2), then
-quantization (`mm_bfp.cc`, int8 weights, 2× throughput + half the DMA, path
-toward Qwen3-27B).
+After FA works end-to-end: quantization (`mm_bfp.cc`, int8 weights, 2×
+throughput + half the DMA), path toward Qwen3-27B.
