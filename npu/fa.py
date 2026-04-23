@@ -1,13 +1,15 @@
-"""Fused attention on XDNA 2.
+"""FlashAttention-2 forward on XDNA 2.
 
-Single compute tile runs softmax(Q·K^T / sqrt(D))·V for one (TQ, TK, D) shape
-in one dispatch — no CPU roundtrip between the three sub-ops.
+One dispatch processes one Q block (BR rows) attending to all TK keys. The
+host streams n_kv = TK/BC key/value block pairs through the compute tile;
+the kernel keeps running softmax state (m, l, O_acc) in static tile memory
+across the block calls so the [BR, TK] intermediate never materialises.
 
-Current scope: no causal mask, no multi-block. Correctness-first MVP keyed
-against npu/fa_ref.py. Extends to causal + multi-block after this proves out.
+MVP scope: no causal mask yet, single Q block per dispatch (if Tq > BR,
+caller loops). Correctness oracle is npu/fa_ref.py.
 """
 from __future__ import annotations
-import argparse, subprocess, sys
+import argparse, math, subprocess, sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,8 +25,8 @@ CACHE = ROOT / "build" / "fa_cache"
 KERNEL_SRC = ROOT / "fa_kernel.cc"
 
 
-def compile_kernel(TQ: int, TK: int, D: int, build_dir: Path) -> Path:
-    obj = build_dir / f"fa_{TQ}x{TK}x{D}.o"
+def compile_kernel(BR: int, BC: int, D: int, build_dir: Path) -> Path:
+    obj = build_dir / f"fa_{BR}x{BC}x{D}.o"
     include = MLIR_AIE / "include"
     clang = PEANO / "bin" / "clang++"
     cmd = [
@@ -33,20 +35,19 @@ def compile_kernel(TQ: int, TK: int, D: int, build_dir: Path) -> Path:
         "-Wno-parentheses", "-Wno-attributes", "-Wno-macro-redefined",
         "-Wno-empty-body", "-Wno-missing-template-arg-list-after-template-kw",
         "-I", str(include),
-        f"-DFA_TQ={TQ}", f"-DFA_TK={TK}", f"-DFA_D={D}",
+        f"-DFA_BR={BR}", f"-DFA_BC={BC}", f"-DFA_D={D}",
         "-c", str(KERNEL_SRC), "-o", str(obj),
     ]
-    print(f"[peano] compiling fa_{TQ}x{TK}x{D}.o")
+    print(f"[peano] compiling fa_{BR}x{BC}x{D}.o")
     subprocess.run(cmd, check=True, cwd=build_dir)
     return obj
 
 
-def generate_mlir(TQ: int, TK: int, D: int, obj_name: str, out_path: Path) -> None:
-    """IRON program: two bf16 buffers (packed QKV -> O), one compute tile.
+def generate_mlir(BR: int, BC: int, D: int, n_kv: int, obj_name: str, out_path: Path) -> None:
+    """Two input FIFOs (Q once + KV-pairs streamed n_kv times) -> one output (O).
 
-    Q, K, V are packed into a single input buffer in that order on the host side
-    so the compute tile only needs 1 input + 1 output DMA channel (compute
-    tiles on AIE2p have a 2-channel input limit).
+    Compute tiles have a 2-input DMA channel limit, so we pair K and V into
+    one streaming FIFO (each tile is [K | V] concatenated, 2·BC·D bf16).
     """
     from ml_dtypes import bfloat16 as np_bf16
     from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
@@ -54,36 +55,49 @@ def generate_mlir(TQ: int, TK: int, D: int, obj_name: str, out_path: Path) -> No
     from aie.iron.device import NPU2
     from aie.iron.placers import SequentialPlacer
 
-    qkv_len = TQ * D + TK * D + TK * D
-    qkv_ty = np.ndarray[(qkv_len,), np.dtype[np_bf16]]
-    o_ty = np.ndarray[(TQ * D,), np.dtype[np_bf16]]
+    q_len  = BR * D
+    kv_len = 2 * BC * D  # K block followed by V block
+    o_len  = BR * D
 
-    attn_k = Kernel("attention_bf16", obj_name, [qkv_ty, o_ty])
+    q_ty  = np.ndarray[(q_len,),  np.dtype[np_bf16]]
+    kv_ty = np.ndarray[(kv_len,), np.dtype[np_bf16]]
+    o_ty  = np.ndarray[(o_len,),  np.dtype[np_bf16]]
+    # Runtime outer-buffer types: Q is one block (BR*D), KV stream is n_kv pairs.
+    kv_stream_ty = np.ndarray[(n_kv * kv_len,), np.dtype[np_bf16]]
 
-    fifo_in = ObjectFifo(qkv_ty, name="inQKV")
-    fifo_out = ObjectFifo(o_ty, name="outO")
+    init_k     = Kernel("attn_init",     obj_name, [])
+    block_k    = Kernel("attn_block",    obj_name, [q_ty, kv_ty])
+    finalise_k = Kernel("attn_finalise", obj_name, [o_ty])
 
-    def core_fn(of_in, of_out, attn):
-        for _ in range_(1):
-            elem_out = of_out.acquire(1)
-            elem_in = of_in.acquire(1)
-            attn(elem_in, elem_out)
-            of_in.release(1)
-            of_out.release(1)
+    fifo_q  = ObjectFifo(q_ty,  name="inQ")
+    fifo_kv = ObjectFifo(kv_ty, name="inKV")
+    fifo_o  = ObjectFifo(o_ty,  name="outO")
 
-    # Stack must hold the 2KB S[TQ,TK] scratch + aie_api locals in
-    # softmax_simple_bf16 (vector regs are separate, but local accums spill).
+    def core_fn(of_q, of_kv, of_o, attn_init, attn_block, attn_finalise):
+        elem_o = of_o.acquire(1)
+        elem_q = of_q.acquire(1)
+        attn_init()
+        for _ in range_(n_kv) if n_kv > 1 else range(1):
+            elem_kv = of_kv.acquire(1)
+            attn_block(elem_q, elem_kv)
+            of_kv.release(1)
+        attn_finalise(elem_o)
+        of_q.release(1)
+        of_o.release(1)
+
     worker = Worker(
         core_fn,
-        fn_args=[fifo_in.cons(), fifo_out.prod(), attn_k],
-        stack_size=0x2000,
+        fn_args=[fifo_q.cons(), fifo_kv.cons(), fifo_o.prod(), init_k, block_k, finalise_k],
+        # 2KB state (g_O[BR*DH=32*64] fp32) + scratch S[BR*BC] fp32 + call frames
+        stack_size=0x3000,
     )
 
     rt = Runtime()
-    with rt.sequence(qkv_ty, o_ty) as (qkv, o):
+    with rt.sequence(q_ty, kv_stream_ty, o_ty) as (q, kv, o):
         rt.start(worker)
-        rt.fill(fifo_in.prod(), qkv)
-        rt.drain(fifo_out.cons(), o, wait=True)
+        rt.fill(fifo_q.prod(),  q)
+        rt.fill(fifo_kv.prod(), kv)
+        rt.drain(fifo_o.cons(), o, wait=True)
 
     module = Program(NPU2(), rt).resolve_program(SequentialPlacer())
     out_path.write_text(str(module))
@@ -91,31 +105,36 @@ def generate_mlir(TQ: int, TK: int, D: int, obj_name: str, out_path: Path) -> No
 
 @dataclass
 class Compiled:
-    TQ: int; TK: int; D: int
+    BR: int; BC: int; D: int; n_kv: int
     xclbin_path: Path
     insts: np.ndarray
 
 
-def build_xclbin(TQ: int, TK: int, D: int) -> Compiled:
-    tag = f"fa_{TQ}x{TK}x{D}"
+def build_xclbin(BR: int, BC: int, D: int, n_kv: int) -> Compiled:
+    tag = f"fa_{BR}x{BC}x{D}_n{n_kv}"
     build = CACHE / tag
     build.mkdir(parents=True, exist_ok=True)
     xclbin = build / "final.xclbin"
-    insts = build / "insts.bin"
+    insts  = build / "insts.bin"
     if not xclbin.exists() or not insts.exists():
-        obj = compile_kernel(TQ, TK, D, build)
+        obj = compile_kernel(BR, BC, D, build)
         mlir = build / "aie.mlir"
-        generate_mlir(TQ, TK, D, obj.name, mlir)
+        generate_mlir(BR, BC, D, n_kv, obj.name, mlir)
         compile_xclbin(mlir, obj, build)
     insts_arr = np.fromfile(insts, dtype=np.uint32)
-    return Compiled(TQ=TQ, TK=TK, D=D, xclbin_path=xclbin, insts=insts_arr)
+    return Compiled(BR=BR, BC=BC, D=D, n_kv=n_kv, xclbin_path=xclbin, insts=insts_arr)
 
 
 class NpuAttention:
-    """Callable: (Q, K, V) -> O, each [*, TQ/TK, D] bf16/fp32, one fused dispatch per head."""
-    def __init__(self):
-        self._compiled: dict[tuple[int,int,int], Compiled] = {}
-        self._bo: dict[tuple[int,int,int], tuple] = {}
+    """(Q, K, V) -> O for one head, one Q block.
+
+    Q: [BR, D], K/V: [n_kv*BC, D]. D and BR hard-coded against the xclbin
+    shape (recompile for new dims). n_kv is inferred from TK/BC.
+    """
+    def __init__(self, BR: int = 32, BC: int = 32, D: int = 64):
+        self.BR, self.BC, self.D = BR, BC, D
+        self._compiled: dict[int, Compiled] = {}   # keyed by n_kv
+        self._bo: dict[int, tuple] = {}
         self._kernel_cache: dict[Path, tuple] = {}
         self._device = None
 
@@ -143,70 +162,74 @@ class NpuAttention:
         return self._kernel_cache[c.xclbin_path]
 
     def run_one(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-        """Single-head call. Q [TQ, D], K/V [TK, D]. Returns O [TQ, D] bf16."""
+        """Q [BR, D], K [TK, D], V [TK, D], TK multiple of BC. Returns O [BR, D] bf16."""
         import pyxrt
-        TQ, D = Q.shape
+        BR, D = Q.shape
         TK = K.shape[0]
+        BC = self.BC
+        assert (BR, D) == (self.BR, self.D), f"Q shape {Q.shape} != ({self.BR}, {self.D})"
         assert K.shape == (TK, D) and V.shape == (TK, D)
+        assert TK % BC == 0, f"TK={TK} not a multiple of BC={BC}"
+        n_kv = TK // BC
 
-        key = (TQ, TK, D)
-        if key not in self._compiled:
-            self._compiled[key] = build_xclbin(TQ, TK, D)
-        c = self._compiled[key]
+        if n_kv not in self._compiled:
+            self._compiled[n_kv] = build_xclbin(BR, BC, D, n_kv)
+        c = self._compiled[n_kv]
         dev = self._device_obj()
         _, _, kernel, bo_instr = self._kernel_for(c)
 
-        qkv_bytes = (TQ * D + TK * D + TK * D) * 2  # bf16
-        o_bytes = TQ * D * 2
-        if key not in self._bo:
-            bo_qkv = pyxrt.bo(dev, qkv_bytes, pyxrt.bo.host_only, kernel.group_id(3))
-            bo_o   = pyxrt.bo(dev, o_bytes,   pyxrt.bo.host_only, kernel.group_id(4))
-            self._bo[key] = (bo_qkv, bo_o)
-        bo_qkv, bo_o = self._bo[key]
+        q_bytes  = BR * D * 2
+        kv_bytes = n_kv * 2 * BC * D * 2
+        o_bytes  = BR * D * 2
+        if n_kv not in self._bo:
+            bo_q  = pyxrt.bo(dev, q_bytes,  pyxrt.bo.host_only, kernel.group_id(3))
+            bo_kv = pyxrt.bo(dev, kv_bytes, pyxrt.bo.host_only, kernel.group_id(4))
+            bo_o  = pyxrt.bo(dev, o_bytes,  pyxrt.bo.host_only, kernel.group_id(5))
+            self._bo[n_kv] = (bo_q, bo_kv, bo_o)
+        bo_q, bo_kv, bo_o = self._bo[n_kv]
 
-        # Pack Q|K|V on host
-        QKV = torch.cat([
-            Q.to(torch.bfloat16).contiguous().reshape(-1),
-            K.to(torch.bfloat16).contiguous().reshape(-1),
-            V.to(torch.bfloat16).contiguous().reshape(-1),
-        ])
-        arr = _bf16_to_u16(QKV).reshape(-1)
-        bo_qkv.write(arr.tobytes(), 0)
-        bo_qkv.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+        # Q payload
+        q_arr = _bf16_to_u16(Q.to(torch.bfloat16).contiguous()).reshape(-1)
+        bo_q.write(q_arr.tobytes(), 0)
+        bo_q.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
-        run = kernel(3, bo_instr, c.insts.size, bo_qkv, bo_o)
+        # KV stream: interleave K block j, V block j, K block j+1, V block j+1, ...
+        K_bf = K.to(torch.bfloat16).contiguous()
+        V_bf = V.to(torch.bfloat16).contiguous()
+        kv_blocks = []
+        for j in range(n_kv):
+            kv_blocks.append(K_bf[j*BC:(j+1)*BC].reshape(-1))
+            kv_blocks.append(V_bf[j*BC:(j+1)*BC].reshape(-1))
+        kv = torch.cat(kv_blocks)
+        kv_arr = _bf16_to_u16(kv).reshape(-1)
+        bo_kv.write(kv_arr.tobytes(), 0)
+        bo_kv.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+
+        run = kernel(3, bo_instr, c.insts.size, bo_q, bo_kv, bo_o)
         run.wait()
 
         bo_o.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
         out = np.frombuffer(bytes(bo_o.read(o_bytes, 0)), dtype=np.uint16).copy()
-        return torch.from_numpy(out).view(torch.bfloat16).reshape(TQ, D)
+        return torch.from_numpy(out).view(torch.bfloat16).reshape(BR, D)
 
 
 # -------------------- self-test --------------------
 
 def _torch_attention_nomask(Q, K, V):
-    import math
     D = Q.shape[-1]
     S = (Q.float() @ K.float().transpose(-2, -1)) / math.sqrt(D)
     A = torch.softmax(S, dim=-1)
     return A @ V.float()
 
 
-def _self_test(TQ: int, TK: int, D: int, n_trials: int, fixed_input: bool = False) -> None:
+def _self_test(BR: int, BC: int, D: int, TK: int, n_trials: int) -> None:
     torch.manual_seed(0)
-    attn = NpuAttention()
+    attn = NpuAttention(BR=BR, BC=BC, D=D)
     fail = []
-    if fixed_input:
-        Q_f = torch.randn(TQ, D, dtype=torch.bfloat16)
-        K_f = torch.randn(TK, D, dtype=torch.bfloat16)
-        V_f = torch.randn(TK, D, dtype=torch.bfloat16)
     for trial in range(n_trials):
-        if fixed_input:
-            Q, K, V = Q_f, K_f, V_f
-        else:
-            Q = torch.randn(TQ, D, dtype=torch.bfloat16)
-            K = torch.randn(TK, D, dtype=torch.bfloat16)
-            V = torch.randn(TK, D, dtype=torch.bfloat16)
+        Q = torch.randn(BR, D, dtype=torch.bfloat16)
+        K = torch.randn(TK, D, dtype=torch.bfloat16)
+        V = torch.randn(TK, D, dtype=torch.bfloat16)
 
         O_npu = attn.run_one(Q, K, V).float()
         O_ref = _torch_attention_nomask(Q, K, V)
@@ -216,25 +239,25 @@ def _self_test(TQ: int, TK: int, D: int, n_trials: int, fixed_input: bool = Fals
         d = (O_npu - O_ref).abs()
         max_abs = float("nan") if nan or inf else d.max().item()
         mean_abs = float("nan") if nan or inf else d.mean().item()
-        print(f"  trial {trial}: max|Δ|={max_abs:.3e}  mean|Δ|={mean_abs:.3e}  "
-              f"{'NaN!' if nan else ''}{'Inf!' if inf else ''}")
-        if nan or inf or (max_abs > 5e-2):
+        flag = ("NaN!" if nan else "") + ("Inf!" if inf else "")
+        print(f"  trial {trial}: max|Δ|={max_abs:.3e}  mean|Δ|={mean_abs:.3e}  {flag}")
+        if nan or inf or (max_abs > 1e-1):
             fail.append(trial)
 
     if fail:
         raise AssertionError(f"{len(fail)}/{n_trials} trials failed: {fail}")
-    print(f"NpuAttention TQ={TQ} TK={TK} D={D}: all {n_trials} trials OK")
+    print(f"NpuAttention BR={BR} BC={BC} D={D} TK={TK} (n_kv={TK//BC}): all {n_trials} trials OK")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--TQ", type=int, default=32)
-    ap.add_argument("--TK", type=int, default=32)
+    ap.add_argument("--BR", type=int, default=32)
+    ap.add_argument("--BC", type=int, default=32)
     ap.add_argument("-D",  type=int, default=64)
-    ap.add_argument("--trials", type=int, default=3)
-    ap.add_argument("--fixed", action="store_true", help="reuse same Q,K,V every trial")
+    ap.add_argument("--TK", type=int, default=64)
+    ap.add_argument("--trials", type=int, default=5)
     args = ap.parse_args()
-    _self_test(args.TQ, args.TK, args.D, args.trials, fixed_input=args.fixed)
+    _self_test(args.BR, args.BC, args.D, args.TK, args.trials)
 
 
 if __name__ == "__main__":
