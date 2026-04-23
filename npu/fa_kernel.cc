@@ -158,9 +158,7 @@ void attn_block(bfloat16 *restrict Q_with_header, bfloat16 *restrict KV) {
 
   // Row-wise online softmax, vectorised over BC. Per row: 1 reduce_max,
   // 1 vector mul (scale by log2e), 1 vector sub, 1 vector exp2, 1 vector
-  // store, 1 reduce_add. Alpha uses the scalar exp_scalar helper — the
-  // two-pass vectorise-alpha attempt was a net regression (~+2.5ms),
-  // probably from lost instruction-level parallelism across iterations.
+  // store, 1 reduce_add. Alpha uses the scalar exp_scalar helper.
   const aie::vector<bfloat16, BC> log2e_v = aie::broadcast<bfloat16, BC>((bfloat16)LOG2E);
   for (int r = 0; r < BR; ++r) {
     aie::vector<bfloat16, BC> s_v = aie::load_v<BC>(&S[r * BC]);
@@ -182,13 +180,17 @@ void attn_block(bfloat16 *restrict Q_with_header, bfloat16 *restrict KV) {
     aie::store_v(&P_row[0], P_v);
     aie::accum<accfloat, BC> P_acc = aie::mul(P_v, aie::broadcast<bfloat16, BC>((bfloat16)1.0f));
     float row_sum = aie::reduce_add(P_acc.to_vector<float>());
-
     g_l[r] = alpha * g_l[r] + row_sum;
 
-    // O[r, :] = alpha · O[r, :] + P_row @ V. Output row spans DH=64 lanes,
-    // split into two 32-lane halves. alpha scales the prior O accumulator
-    // via a vector mul; each P_row[c] is then a bf16 scalar broadcast-MAC
-    // against one row of V (both halves).
+    // O[r, :] = alpha · O[r, :] + P_row @ V. DH=64 split into two 32-lane
+    // halves. alpha rescales O_prev; then BC scalar-broadcast MACs accumulate
+    // P_row[c] · V[c, :] row-by-row in fp32, storing bf16 back to g_O.
+    //
+    // We tried replacing this with aie::mmul<4,8,8> for P·V, but the scatter
+    // of P from softmax into 4×8 tiles + gather of the fp32 output back to
+    // row-major ate the mmul savings (1ms, well inside noise) AND storing
+    // O_new as bf16 broke top-1 precision across 4 kv-blocks. Inline
+    // bf16-accum path below keeps the fp32 running sum for precision.
     const bfloat16 alpha_bf = (bfloat16)alpha;
     aie::accum<accfloat, 32> o0 = aie::mul(aie::load_v<32>(&g_O[r * DH]),       alpha_bf);
     aie::accum<accfloat, 32> o1 = aie::mul(aie::load_v<32>(&g_O[r * DH + 32]), alpha_bf);

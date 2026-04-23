@@ -232,11 +232,11 @@ class NpuAttention:
         K_bf = K_stack.to(torch.bfloat16).contiguous().view(N, n_kv, MT, T_MAC, MK, S_MAC)
         K_tiled = K_bf.permute(0, 1, 4, 2, 5, 3).contiguous()  # [N, n_kv, MK, MT, S, T]
 
-        # V stays row-major [N, n_kv, BC, D] since the S·V path still uses the
-        # scalar-P_row vector MAC pattern (mmul rewrite for S·V is follow-up).
+        # V stays row-major [N, n_kv, BC, D] — the S·V path uses scalar-P_row
+        # vector MAC over the BC dim; tiling V for mmul is correct but its
+        # win is eaten by the scatter-P / gather-O work around the matmul.
         V_bf = V_stack.to(torch.bfloat16).contiguous().view(N, n_kv, BC, D)
 
-        # Interleave K-tiled, V-row-major per kv block.
         kv_blocks = []
         for ni in range(N):
             for j in range(n_kv):
