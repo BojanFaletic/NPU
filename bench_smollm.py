@@ -21,28 +21,37 @@ def main():
     ap.add_argument("--lengths", default="16,64,256,512,1024")
     ap.add_argument("--iters", type=int, default=5)
     args = ap.parse_args()
+    lengths = [int(x) for x in args.lengths.split(",")]
 
     model_cpu, tok, _ = load(torch.float32)
 
-    print("loading NPU model…")
-    model_npu, _, _ = load(torch.float32)
-    model_npu.enable_npu()
-    # Warm all shapes we'll use
+    print("loading NPU (proj only) model…")
+    model_npu_proj, _, _ = load(torch.float32)
+    model_npu_proj.enable_npu(softmax=False)
+
+    print("loading NPU (proj + softmax) model…")
+    model_npu_full, _, _ = load(torch.float32)
+    model_npu_full.enable_npu(softmax=True)
+
     print("compiling NPU xclbins…")
-    for L in [int(x) for x in args.lengths.split(",")]:
+    for L in lengths:
         ids = torch.randint(0, 1000, (1, L))
         t0 = time.time()
-        _ = model_npu.forward(ids)
+        _ = model_npu_proj.forward(ids)
+        _ = model_npu_full.forward(ids)
         print(f"  L={L}: compile+first-call {time.time()-t0:.1f}s")
 
     print()
-    print(f"{'length':>8}  {'cpu (ms)':>12}  {'npu (ms)':>12}  {'speedup':>8}  {'cpu tok/s':>12}  {'npu tok/s':>12}")
-    for L in [int(x) for x in args.lengths.split(",")]:
+    print(f"{'length':>8}  {'cpu':>10}  {'npu-proj':>10}  {'npu-full':>10}  "
+          f"{'p-speedup':>10}  {'f-speedup':>10}  {'sm-delta':>10}")
+    for L in lengths:
         ids = torch.randint(0, 1000, (1, L))
-        t_cpu = bench(model_cpu, ids, iters=args.iters)
-        t_npu = bench(model_npu, ids, iters=args.iters)
-        print(f"{L:>8}  {t_cpu*1e3:>12.1f}  {t_npu*1e3:>12.1f}  {t_cpu/t_npu:>8.2f}x  "
-              f"{L/t_cpu:>12.1f}  {L/t_npu:>12.1f}")
+        t_cpu  = bench(model_cpu,       ids, iters=args.iters)
+        t_proj = bench(model_npu_proj,  ids, iters=args.iters)
+        t_full = bench(model_npu_full,  ids, iters=args.iters)
+        print(f"{L:>8}  {t_cpu*1e3:>9.1f}ms  {t_proj*1e3:>9.1f}ms  {t_full*1e3:>9.1f}ms  "
+              f"{t_cpu/t_proj:>9.2f}x  {t_cpu/t_full:>9.2f}x  "
+              f"{(t_full-t_proj)*1e3:>+9.1f}ms")
 
 
 if __name__ == "__main__":
