@@ -84,19 +84,63 @@ void attn_block(bfloat16 *restrict Q_with_header, bfloat16 *restrict KV) {
   bfloat16 *V = KV + BC * DH;
   const int start_col = g_block_idx * BC;
 
-  // S = Q · K^T · inv_sqrt_d stored bf16 (BC=32 fits the native SIMD width,
-  // so softmax below can consume each row as one vector load).
+  // S = Q · K^T · inv_sqrt_d. The host pre-tiles Q into [BR/r][D/s][r][s] and
+  // K into [D/s][BC/t][s][t] with r=4, s=8, t=8 so each tile is a contiguous
+  // 64-byte (32 bf16) vector. aie::mmul<r,s,t> produces a 4×8 fp32 output
+  // tile per call, accumulating over D/s inner steps, and doesn't need a
+  // per-element reduce_add (the accumulator IS the output tile).
+  constexpr int R_MAC = 4;
+  constexpr int S_MAC = 8;
+  constexpr int T_MAC = 8;
+  constexpr int MR = BR / R_MAC;     // 8 output row-tiles
+  constexpr int MT = BC / T_MAC;     // 4 output col-tiles
+  constexpr int MK = DH / S_MAC;     // 8 accumulation steps
+  static_assert(BR % R_MAC == 0 && BC % T_MAC == 0 && DH % S_MAC == 0,
+                "Tile sizes must divide BR/BC/DH");
+
+  using MMUL = aie::mmul<R_MAC, S_MAC, T_MAC, bfloat16, bfloat16, accauto>;
+
+  alignas(64) float S_tiled[BR * BC];  // [MR][MT][r][t] row-major tile order
+  for (int i = 0; i < MR; ++i) {
+    for (int j = 0; j < MT; ++j) {
+      // A = Q_tile row i, B = K_tile col j; accumulate over k = 0..MK-1.
+      const bfloat16 *pA = Q + i * MK * R_MAC * S_MAC;
+      const bfloat16 *pB = K + j * S_MAC * T_MAC;  // K tiled as [MK][MT][s][t]
+      aie::vector<bfloat16, R_MAC * S_MAC> A = aie::load_v<R_MAC * S_MAC>(pA);
+      aie::vector<bfloat16, S_MAC * T_MAC> B = aie::load_v<S_MAC * T_MAC>(pB);
+      MMUL C;
+      C.mul(A, B);
+      pA += R_MAC * S_MAC;
+      pB += MT * S_MAC * T_MAC;
+      for (int k = 1; k < MK; ++k) {
+        A = aie::load_v<R_MAC * S_MAC>(pA); pA += R_MAC * S_MAC;
+        B = aie::load_v<S_MAC * T_MAC>(pB); pB += MT * S_MAC * T_MAC;
+        C.mac(A, B);
+      }
+      aie::store_v(&S_tiled[(i * MT + j) * R_MAC * T_MAC], C.template to_vector<float>());
+    }
+  }
+
+  // Scale by inv_sqrt_d and convert to bf16 row-major S[BR][BC]. Each 4×8 tile
+  // is 32 consecutive fp32 values stored as [row0..3][col0..7] row-major
+  // within the tile. We linearise back into row-major S.
   alignas(64) bfloat16 S[BR * BC];
-  for (int r = 0; r < BR; ++r) {
-    aie::vector<bfloat16, 32> q0 = aie::load_v<32>(&Q[r * DH]);
-    aie::vector<bfloat16, 32> q1 = aie::load_v<32>(&Q[r * DH + 32]);
-    for (int c = 0; c < BC; ++c) {
-      aie::vector<bfloat16, 32> k0 = aie::load_v<32>(&K[c * DH]);
-      aie::vector<bfloat16, 32> k1 = aie::load_v<32>(&K[c * DH + 32]);
-      aie::accum<accfloat, 32> acc = aie::mul(q0, k0);
-      acc = aie::mac(acc, q1, k1);
-      float dot = aie::reduce_add(acc.to_vector<float>()) * INV_SQRT_D;
-      S[r * BC + c] = (bfloat16)dot;
+  const aie::vector<float, R_MAC * T_MAC> scale_v =
+      aie::broadcast<float, R_MAC * T_MAC>(INV_SQRT_D);
+  for (int i = 0; i < MR; ++i) {
+    for (int j = 0; j < MT; ++j) {
+      aie::vector<float, R_MAC * T_MAC> tile =
+          aie::load_v<R_MAC * T_MAC>(&S_tiled[(i * MT + j) * R_MAC * T_MAC]);
+      aie::accum<accfloat, R_MAC * T_MAC> scaled = aie::mul(tile, scale_v);
+      aie::vector<bfloat16, R_MAC * T_MAC> bf = scaled.to_vector<bfloat16>();
+      // Scatter 4×8 tile into row-major S[BR, BC]
+      alignas(64) bfloat16 tmp[R_MAC * T_MAC];
+      aie::store_v(&tmp[0], bf);
+      for (int rr = 0; rr < R_MAC; ++rr) {
+        for (int tt = 0; tt < T_MAC; ++tt) {
+          S[(i * R_MAC + rr) * BC + (j * T_MAC + tt)] = tmp[rr * T_MAC + tt];
+        }
+      }
     }
   }
 

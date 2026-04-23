@@ -208,23 +208,42 @@ class NpuAttention:
             self._bo[key] = (bo_q, bo_kv, bo_o)
         bo_q, bo_kv, bo_o = self._bo[key]
 
-        # Build Q buffer: N tiles of [header || Q_block]. Assemble as a flat
-        # bf16 tensor in one shot and pay one torch.cat.
-        Q_bf = Q_stack.to(torch.bfloat16).contiguous()  # [N, BR, D]
+        # Native bf16 mac shape for aie::mmul on AIE2p
+        R_MAC, S_MAC, T_MAC = 4, 8, 8
+        MR, MK, MT = BR // R_MAC, D // S_MAC, BC // T_MAC
+
+        # Q: [N, BR, D] -> tiled [N, MR, MK, R_MAC, S_MAC] contiguous so each
+        # 4×8 A-tile is one vector load in the kernel.
+        Q_bf = Q_stack.to(torch.bfloat16).contiguous()
+        Q_tiled = Q_bf.view(N, MR, R_MAC, MK, S_MAC).permute(0, 1, 3, 2, 4).contiguous()
+
+        # Header (start_row, causal) then Q_tiled.
         headers = torch.zeros((N, HEADER_BF16), dtype=torch.bfloat16)
         headers[:, 0] = torch.tensor(start_rows, dtype=torch.bfloat16)
         headers[:, 1] = 1.0 if causal else 0.0
-        q_tiles = torch.cat([headers, Q_bf.reshape(N, -1)], dim=1)  # [N, q_tile_len]
+        q_tiles = torch.cat([headers, Q_tiled.reshape(N, -1)], dim=1)
         q_arr = _bf16_to_u16(q_tiles.reshape(-1)).reshape(-1)
         bo_q.write(q_arr.tobytes(), 0)
         bo_q.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
-        # Build KV buffer: for each Q-block, stream n_kv (K_block, V_block) pairs.
-        # Shape plan: [N, n_kv, 2, BC, D] → flatten.
-        K_bf = K_stack.to(torch.bfloat16).contiguous().view(N, n_kv, BC, D)
+        # K: [N, TK, D] = [N, n_kv, BC, D]. For each kv-block, tile K as the B
+        # operand of mmul for S = Q·K^T, i.e. K_tiled[k_chunk, j_chunk, s, t]
+        # = K[j_chunk*t + t, k_chunk*s + s].
+        K_bf = K_stack.to(torch.bfloat16).contiguous().view(N, n_kv, MT, T_MAC, MK, S_MAC)
+        K_tiled = K_bf.permute(0, 1, 4, 2, 5, 3).contiguous()  # [N, n_kv, MK, MT, S, T]
+
+        # V stays row-major [N, n_kv, BC, D] since the S·V path still uses the
+        # scalar-P_row vector MAC pattern (mmul rewrite for S·V is follow-up).
         V_bf = V_stack.to(torch.bfloat16).contiguous().view(N, n_kv, BC, D)
-        kv_stream = torch.stack([K_bf, V_bf], dim=2)  # [N, n_kv, 2, BC, D]
-        kv_arr = _bf16_to_u16(kv_stream.reshape(-1)).reshape(-1)
+
+        # Interleave K-tiled, V-row-major per kv block.
+        kv_blocks = []
+        for ni in range(N):
+            for j in range(n_kv):
+                kv_blocks.append(K_tiled[ni, j].reshape(-1))
+                kv_blocks.append(V_bf[ni, j].reshape(-1))
+        kv = torch.cat(kv_blocks)
+        kv_arr = _bf16_to_u16(kv).reshape(-1)
         bo_kv.write(kv_arr.tobytes(), 0)
         bo_kv.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
