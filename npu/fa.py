@@ -47,13 +47,15 @@ HEADER_BF16 = 32  # matches fa_kernel.cc; header riding in Q buffer
 
 
 def generate_mlir(BR: int, BC: int, D: int, n_kv: int, n_q_total: int,
-                  obj_name: str, out_path: Path) -> None:
-    """Two input FIFOs (Q+header stream, KV-pair stream) -> O stream. One
-    dispatch processes n_q_total Q-blocks (amortises host-side dispatch
-    overhead across all heads × Q-blocks in a layer).
+                  n_cores: int, obj_name: str, out_path: Path) -> None:
+    """n_q_total Q-blocks processed in one dispatch, split across n_cores
+    compute tiles via memtile-aggregated ObjectFifo.split/join.
 
-    Q carries start_row + causal flag inline; compute tiles have a 2-input
-    DMA channel limit so K and V are paired into one streaming FIFO.
+    Memtile layout: each FIFO aggregates n_cores tiles per memtile iteration;
+    split() chops by per-core offset so core i gets tile i of each memtile.
+    Total iterations per core = n_q_total / n_cores (outer Q loop) and
+    n_q_total / n_cores * n_kv (KV stream inner). Host lays data out as
+    [iter_0 core_0, iter_0 core_1, ..., iter_0 core_{n_cores-1}, iter_1 core_0, ...].
     """
     from ml_dtypes import bfloat16 as np_bf16
     from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
@@ -61,26 +63,47 @@ def generate_mlir(BR: int, BC: int, D: int, n_kv: int, n_q_total: int,
     from aie.iron.device import NPU2
     from aie.iron.placers import SequentialPlacer
 
+    assert n_q_total % n_cores == 0, f"n_q_total={n_q_total} not divisible by n_cores={n_cores}"
+    n_per_core = n_q_total // n_cores
+
     q_len  = HEADER_BF16 + BR * D
     kv_len = 2 * BC * D
     o_len  = BR * D
 
-    q_ty  = np.ndarray[(q_len,),  np.dtype[np_bf16]]
-    kv_ty = np.ndarray[(kv_len,), np.dtype[np_bf16]]
-    o_ty  = np.ndarray[(o_len,),  np.dtype[np_bf16]]
+    q_tile_ty  = np.ndarray[(q_len,),  np.dtype[np_bf16]]
+    kv_tile_ty = np.ndarray[(kv_len,), np.dtype[np_bf16]]
+    o_tile_ty  = np.ndarray[(o_len,),  np.dtype[np_bf16]]
+
+    q_mem_ty  = np.ndarray[(n_cores * q_len,),  np.dtype[np_bf16]]
+    kv_mem_ty = np.ndarray[(n_cores * kv_len,), np.dtype[np_bf16]]
+    o_mem_ty  = np.ndarray[(n_cores * o_len,),  np.dtype[np_bf16]]
+
     q_stream_ty  = np.ndarray[(n_q_total * q_len,),         np.dtype[np_bf16]]
     kv_stream_ty = np.ndarray[(n_q_total * n_kv * kv_len,), np.dtype[np_bf16]]
     o_stream_ty  = np.ndarray[(n_q_total * o_len,),         np.dtype[np_bf16]]
 
-    block_k    = Kernel("attn_block",    obj_name, [q_ty, kv_ty])
-    finalise_k = Kernel("attn_finalise", obj_name, [o_ty])
+    block_k    = Kernel("attn_block",    obj_name, [q_tile_ty, kv_tile_ty])
+    finalise_k = Kernel("attn_finalise", obj_name, [o_tile_ty])
 
-    fifo_q  = ObjectFifo(q_ty,  name="inQ")
-    fifo_kv = ObjectFifo(kv_ty, name="inKV")
-    fifo_o  = ObjectFifo(o_ty,  name="outO")
+    fifo_q  = ObjectFifo(q_mem_ty,  name="inQ")
+    fifo_kv = ObjectFifo(kv_mem_ty, name="inKV")
+    fifo_o  = ObjectFifo(o_mem_ty,  name="outO")
+
+    q_per_core = fifo_q.cons().split(
+        offsets=[q_len * i for i in range(n_cores)],
+        obj_types=[q_tile_ty] * n_cores,
+    )
+    kv_per_core = fifo_kv.cons().split(
+        offsets=[kv_len * i for i in range(n_cores)],
+        obj_types=[kv_tile_ty] * n_cores,
+    )
+    o_per_core = fifo_o.prod().join(
+        offsets=[o_len * i for i in range(n_cores)],
+        obj_types=[o_tile_ty] * n_cores,
+    )
 
     def core_fn(of_q, of_kv, of_o, attn_block, attn_finalise):
-        for _ in range_(n_q_total) if n_q_total > 1 else range(1):
+        for _ in range_(n_per_core) if n_per_core > 1 else range(1):
             elem_o = of_o.acquire(1)
             elem_q = of_q.acquire(1)
             for _ in range_(n_kv) if n_kv > 1 else range(1):
@@ -91,16 +114,18 @@ def generate_mlir(BR: int, BC: int, D: int, n_kv: int, n_q_total: int,
             of_q.release(1)
             of_o.release(1)
 
-    worker = Worker(
-        core_fn,
-        fn_args=[fifo_q.cons(), fifo_kv.cons(), fifo_o.prod(), block_k, finalise_k],
-        # g_O[BR*DH] bf16 = 4KB + g_m/g_l = 256B + S[BR*BC] fp32 = 4KB stack
-        stack_size=0x3000,
-    )
+    workers = []
+    for i in range(n_cores):
+        workers.append(Worker(
+            core_fn,
+            fn_args=[q_per_core[i].cons(), kv_per_core[i].cons(),
+                     o_per_core[i].prod(), block_k, finalise_k],
+            stack_size=0x3000,
+        ))
 
     rt = Runtime()
     with rt.sequence(q_stream_ty, kv_stream_ty, o_stream_ty) as (q, kv, o):
-        rt.start(worker)
+        rt.start(*workers)
         rt.fill(fifo_q.prod(),  q)
         rt.fill(fifo_kv.prod(), kv)
         rt.drain(fifo_o.cons(), o, wait=True)
@@ -111,13 +136,14 @@ def generate_mlir(BR: int, BC: int, D: int, n_kv: int, n_q_total: int,
 
 @dataclass
 class Compiled:
-    BR: int; BC: int; D: int; n_kv: int; n_q_total: int
+    BR: int; BC: int; D: int; n_kv: int; n_q_total: int; n_cores: int
     xclbin_path: Path
     insts: np.ndarray
 
 
-def build_xclbin(BR: int, BC: int, D: int, n_kv: int, n_q_total: int) -> Compiled:
-    tag = f"fa_{BR}x{BC}x{D}_n{n_kv}_q{n_q_total}"
+def build_xclbin(BR: int, BC: int, D: int, n_kv: int, n_q_total: int,
+                 n_cores: int) -> Compiled:
+    tag = f"fa_{BR}x{BC}x{D}_n{n_kv}_q{n_q_total}_c{n_cores}"
     build = CACHE / tag
     build.mkdir(parents=True, exist_ok=True)
     xclbin = build / "final.xclbin"
@@ -125,23 +151,25 @@ def build_xclbin(BR: int, BC: int, D: int, n_kv: int, n_q_total: int) -> Compile
     if not xclbin.exists() or not insts.exists():
         obj = compile_kernel(BR, BC, D, build)
         mlir = build / "aie.mlir"
-        generate_mlir(BR, BC, D, n_kv, n_q_total, obj.name, mlir)
+        generate_mlir(BR, BC, D, n_kv, n_q_total, n_cores, obj.name, mlir)
         compile_xclbin(mlir, obj, build)
     insts_arr = np.fromfile(insts, dtype=np.uint32)
     return Compiled(BR=BR, BC=BC, D=D, n_kv=n_kv, n_q_total=n_q_total,
-                    xclbin_path=xclbin, insts=insts_arr)
+                    n_cores=n_cores, xclbin_path=xclbin, insts=insts_arr)
 
 
 class NpuAttention:
     """Callable that runs FA on a batch of Q-blocks in one NPU dispatch.
 
-    Batching across Q-blocks amortises dispatch overhead (PCIe upload +
-    Python marshalling + kernel invoke). xclbins are keyed on (n_kv, n_q)
-    so a full prefill reuses the same xclbin across layers.
+    Q-blocks are split across n_cores compute tiles (default 4) for
+    parallel execution. The host pads N up to a multiple of n_cores with
+    dummy zero-data blocks whose outputs are discarded. xclbins are keyed
+    on (n_kv, n_q_total_padded, n_cores).
     """
-    def __init__(self, BR: int = 32, BC: int = 32, D: int = 64):
+    def __init__(self, BR: int = 32, BC: int = 32, D: int = 64, n_cores: int = 4):
         self.BR, self.BC, self.D = BR, BC, D
-        self._compiled: dict[tuple[int, int], Compiled] = {}   # (n_kv, n_q_total)
+        self.n_cores = n_cores
+        self._compiled: dict[tuple[int, int], Compiled] = {}   # (n_kv, n_q_padded)
         self._bo: dict[tuple[int, int], tuple] = {}
         self._kernel_cache: dict[Path, tuple] = {}
         self._device = None
@@ -172,25 +200,39 @@ class NpuAttention:
     def run_batch(
         self,
         Q_stack: torch.Tensor,     # [N, BR, D]
-        K_stack: torch.Tensor,     # [N, TK, D] — per-Q-block K (dup across Q-blocks of same head)
+        K_stack: torch.Tensor,     # [N, TK, D]
         V_stack: torch.Tensor,     # [N, TK, D]
         start_rows: list[int],     # length N
         causal: bool = True,
     ) -> torch.Tensor:
         """Return O_stack [N, BR, D] bf16. TK must be a multiple of BC."""
         import pyxrt
-        N, BR, D = Q_stack.shape
+        N_in, BR, D = Q_stack.shape
         TK = K_stack.shape[1]
         BC = self.BC
         assert (BR, D) == (self.BR, self.D)
-        assert K_stack.shape == (N, TK, D) and V_stack.shape == (N, TK, D)
+        assert K_stack.shape == (N_in, TK, D) and V_stack.shape == (N_in, TK, D)
         assert TK % BC == 0
-        assert len(start_rows) == N
+        assert len(start_rows) == N_in
         n_kv = TK // BC
+        n_cores = self.n_cores
+
+        # Pad N up to a multiple of n_cores with dummy Q-blocks. Dummy rows
+        # have start_row set to a very negative value so the causal mask
+        # zeroes all their output; the output slice discards these rows.
+        N_pad = ((N_in + n_cores - 1) // n_cores) * n_cores
+        if N_pad != N_in:
+            pad = N_pad - N_in
+            Q_stack = torch.cat([Q_stack, Q_stack.new_zeros(pad, BR, D)], dim=0)
+            K_stack = torch.cat([K_stack, K_stack.new_zeros(pad, TK, D)], dim=0)
+            V_stack = torch.cat([V_stack, V_stack.new_zeros(pad, TK, D)], dim=0)
+            start_rows = list(start_rows) + [-1_000_000] * pad  # well past any real col
+        N = N_pad
+        n_per_core = N // n_cores
 
         key = (n_kv, N)
         if key not in self._compiled:
-            self._compiled[key] = build_xclbin(BR, BC, D, n_kv, N)
+            self._compiled[key] = build_xclbin(BR, BC, D, n_kv, N, n_cores)
         c = self._compiled[key]
         dev = self._device_obj()
         _, _, kernel, bo_instr = self._kernel_for(c)
@@ -208,42 +250,47 @@ class NpuAttention:
             self._bo[key] = (bo_q, bo_kv, bo_o)
         bo_q, bo_kv, bo_o = self._bo[key]
 
-        # Native bf16 mac shape for aie::mmul on AIE2p
         R_MAC, S_MAC, T_MAC = 4, 8, 8
         MR, MK, MT = BR // R_MAC, D // S_MAC, BC // T_MAC
 
-        # Q: [N, BR, D] -> tiled [N, MR, MK, R_MAC, S_MAC] contiguous so each
-        # 4×8 A-tile is one vector load in the kernel.
         Q_bf = Q_stack.to(torch.bfloat16).contiguous()
         Q_tiled = Q_bf.view(N, MR, R_MAC, MK, S_MAC).permute(0, 1, 3, 2, 4).contiguous()
 
-        # Header (start_row, causal) then Q_tiled.
         headers = torch.zeros((N, HEADER_BF16), dtype=torch.bfloat16)
         headers[:, 0] = torch.tensor(start_rows, dtype=torch.bfloat16)
         headers[:, 1] = 1.0 if causal else 0.0
-        q_tiles = torch.cat([headers, Q_tiled.reshape(N, -1)], dim=1)
+        q_tiles = torch.cat([headers, Q_tiled.reshape(N, -1)], dim=1)  # [N, q_tile_len]
+
+        # Memtile layout: for each of n_per_core outer iterations, stack
+        # n_cores tiles contiguously. Flat block f = iter*n_cores + core.
+        # q_tiles is already ordered by f (f=0 first), so reshape-and-permute
+        # isn't needed — [N, q_tile_len] flattened is exactly the layout
+        # the memtile expects (iter 0: [t0, t1, ..., t_{nc-1}], then iter 1, ...).
         q_arr = _bf16_to_u16(q_tiles.reshape(-1)).reshape(-1)
         bo_q.write(q_arr.tobytes(), 0)
         bo_q.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
-        # K: [N, TK, D] = [N, n_kv, BC, D]. For each kv-block, tile K as the B
-        # operand of mmul for S = Q·K^T, i.e. K_tiled[k_chunk, j_chunk, s, t]
-        # = K[j_chunk*t + t, k_chunk*s + s].
         K_bf = K_stack.to(torch.bfloat16).contiguous().view(N, n_kv, MT, T_MAC, MK, S_MAC)
         K_tiled = K_bf.permute(0, 1, 4, 2, 5, 3).contiguous()  # [N, n_kv, MK, MT, S, T]
-
-        # V stays row-major [N, n_kv, BC, D] — the S·V path uses scalar-P_row
-        # vector MAC over the BC dim; tiling V for mmul is correct but its
-        # win is eaten by the scatter-P / gather-O work around the matmul.
         V_bf = V_stack.to(torch.bfloat16).contiguous().view(N, n_kv, BC, D)
 
-        kv_blocks = []
-        for ni in range(N):
-            for j in range(n_kv):
-                kv_blocks.append(K_tiled[ni, j].reshape(-1))
-                kv_blocks.append(V_bf[ni, j].reshape(-1))
-        kv = torch.cat(kv_blocks)
-        kv_arr = _bf16_to_u16(kv).reshape(-1)
+        # KV memtile layout: for each outer iter and each kv_iter (inner),
+        # stack n_cores KV tiles. So the flat order is
+        #   [iter_0 kv_0 core_0, ..., iter_0 kv_0 core_{nc-1},
+        #    iter_0 kv_1 core_0, ..., iter_0 kv_{nkv-1} core_{nc-1},
+        #    iter_1 kv_0 core_0, ...].
+        # Flat block f = iter * nc + core; for (iter, kv, core) we pick
+        # KV[f, kv]. Reshape+permute gets us there.
+        kv_tile_flat_bytes = K_tiled.reshape(N, n_kv, -1)
+        kv_tile_flat_v = V_bf.reshape(N, n_kv, -1)
+        # Shape [N, n_kv, 2, BC*D] (K and V interleaved per tile)
+        kv_pairs = torch.stack([kv_tile_flat_bytes, kv_tile_flat_v], dim=2)
+        # View [n_per_core, n_cores, n_kv, 2, BC*D] then permute to
+        # [n_per_core, n_kv, n_cores, 2, BC*D] so the innermost fast axis
+        # is (2, BC*D) = one KV tile.
+        kv_pairs = (kv_pairs.view(n_per_core, n_cores, n_kv, 2, BC * D)
+                            .permute(0, 2, 1, 3, 4).contiguous())
+        kv_arr = _bf16_to_u16(kv_pairs.reshape(-1)).reshape(-1)
         bo_kv.write(kv_arr.tobytes(), 0)
         bo_kv.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
@@ -252,7 +299,8 @@ class NpuAttention:
 
         bo_o.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
         out = np.frombuffer(bytes(bo_o.read(o_bytes, 0)), dtype=np.uint16).copy()
-        return torch.from_numpy(out).view(torch.bfloat16).reshape(N, BR, D)
+        out_t = torch.from_numpy(out).view(torch.bfloat16).reshape(N, BR, D)
+        return out_t[:N_in]  # discard padding rows
 
     def run_one(
         self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,

@@ -44,23 +44,26 @@ the end goal is Qwen3-27B/32B running efficiently on the same laptop.
   mask supported via a tiny header in the Q buffer (`start_row` +
   `causal` flag). Tested TK up to 512 with causal, max|Δ|≈4.7e-2.
 - **SmolLM integration**: `smollm.py --npu` enables FA for prefill (T>1).
-  One dispatch per layer batches all Hq × n_q Q-blocks. Q·K^T uses
-  `aie::mmul<4,8,8>` on host-pre-tiled Q and K (no per-element reduce_add);
-  softmax is vectorised over BC (1 exp2 per row); S·V still uses a scalar-
-  P_row vector MAC (mmul there gave +1 ms but broke top-1 precision
-  across 4 kv-blocks). **Top-1 matches HF** on simple prompts. End-to-end
-  prefill 5.8× slower than CPU at T=128 (down from 8.5× before mmul):
+  One dispatch per layer; the N = Hq × n_q Q-blocks are split across **4
+  compute cores** via memtile-aggregated ObjectFifo.split/join (padded to
+  a multiple of 4). Inside the kernel, Q·K^T uses `aie::mmul<4,8,8>` on
+  host-pre-tiled Q and K (no per-element reduce_add); softmax is
+  vectorised over BC (1 exp2 per row); S·V still uses a scalar-P_row
+  vector MAC (mmul there broke top-1 precision across kv-blocks). **Top-1
+  matches HF** on tested prompts. End-to-end prefill 4-7× slower than
+  CPU, down from 30-180× at session start:
 
   ```
   T    cpu(ms)  npu(ms)  ratio
-   16     53      383    0.138x
-   32     54      387    0.139x
-   64     74      424    0.174x
-  128    121      693    0.174x
+   16     40      324    0.122x
+   32     46      316    0.146x
+   64     77      349    0.221x
+  128    101      411    0.247x
   ```
 
-  Session arc: 30-180× slower → 5-7× slower across three kernel
-  optimisations (softmax vec, mmul Q·K^T, per-layer head batching).
+  Session arc: four kernel optimisations (softmax vec → mmul Q·K^T →
+  per-layer head batching → 4-core split). Kernel-only time for T=128
+  went 38.9 ms → 4.25 ms (9×); full end-to-end went 1400 ms → 411 ms (3.4×).
 - **Benchmarks** — at short prefill lengths NPU is still **slower** than CPU
   (~0.2× at L=16, ~0.9× at L=2048), fixed per-op dispatch overhead dominates.
   Useful prefill win starts needing less driver-Python overhead per op.

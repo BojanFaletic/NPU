@@ -214,7 +214,7 @@ class SmolLM:
                 layer.npu["softmax"] = shared_softmax
         if attention:
             from npu.fa import NpuAttention
-            shared_fa = NpuAttention(BR=32, BC=32, D=self.cfg.head_dim)
+            shared_fa = NpuAttention(BR=32, BC=32, D=self.cfg.head_dim, n_cores=4)
             for layer in self.layers:
                 layer.npu["attention"] = shared_fa
 
