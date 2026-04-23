@@ -61,7 +61,8 @@ def empty_cache(cfg: Config) -> KVCache:
 
 
 class Layer:
-    __slots__ = ("wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down", "ln1", "ln2", "npu")
+    __slots__ = ("wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down", "ln1", "ln2",
+                 "wqkv", "w_gate_up", "npu")
 
     def __init__(self, sd: dict, i: int):
         p = f"model.layers.{i}."
@@ -74,6 +75,10 @@ class Layer:
         self.w_down = sd[p + "mlp.down_proj.weight"]
         self.ln1 = sd[p + "input_layernorm.weight"]
         self.ln2 = sd[p + "post_attention_layernorm.weight"]
+        # Fused weights: F.linear(x, W) = x @ W.T, so vstacking out-dims gives a
+        # single dispatch whose output we slice on the N axis.
+        self.wqkv = torch.cat([self.wq, self.wk, self.wv], dim=0)
+        self.w_gate_up = torch.cat([self.w_gate, self.w_up], dim=0)
         self.npu: dict[str, object] | None = None  # filled by SmolLM when --npu
 
     def _lin(self, name: str, x: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
@@ -132,9 +137,16 @@ class Layer:
         B, T, D = x.shape
         Hq, Hkv, Dh = cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
         h = rms_norm(x, self.ln1, cfg.rms_eps)
-        q = self._lin("wq", h, self.wq).view(B, T, Hq,  Dh).transpose(1, 2)
-        k = self._lin("wk", h, self.wk).view(B, T, Hkv, Dh).transpose(1, 2)
-        v = self._lin("wv", h, self.wv).view(B, T, Hkv, Dh).transpose(1, 2)
+        if self.npu is not None and "wqkv" in self.npu:
+            qkv = self.npu["wqkv"](h)
+            Nq, Nk = Hq * Dh, Hkv * Dh
+            q = qkv[..., :Nq].view(B, T, Hq,  Dh).transpose(1, 2)
+            k = qkv[..., Nq:Nq + Nk].view(B, T, Hkv, Dh).transpose(1, 2)
+            v = qkv[..., Nq + Nk:].view(B, T, Hkv, Dh).transpose(1, 2)
+        else:
+            q = self._lin("wq", h, self.wq).view(B, T, Hq,  Dh).transpose(1, 2)
+            k = self._lin("wk", h, self.wk).view(B, T, Hkv, Dh).transpose(1, 2)
+            v = self._lin("wv", h, self.wv).view(B, T, Hkv, Dh).transpose(1, 2)
         # RoPE uses absolute positions [start_pos, start_pos + T)
         q = apply_rope(q, cos[start_pos:start_pos + T], sin[start_pos:start_pos + T])
         k = apply_rope(k, cos[start_pos:start_pos + T], sin[start_pos:start_pos + T])
@@ -168,8 +180,13 @@ class Layer:
         x = x + self._lin("wo", o, self.wo)
         # --- MLP (SwiGLU) ---
         h = rms_norm(x, self.ln2, cfg.rms_eps)
-        gate = F.silu(self._lin("w_gate", h, self.w_gate))
-        up = self._lin("w_up", h, self.w_up)
+        if self.npu is not None and "w_gate_up" in self.npu:
+            gu = self.npu["w_gate_up"](h)
+            gate = F.silu(gu[..., :cfg.ffn_dim])
+            up = gu[..., cfg.ffn_dim:]
+        else:
+            gate = F.silu(self._lin("w_gate", h, self.w_gate))
+            up = self._lin("w_up", h, self.w_up)
         x = x + self._lin("w_down", gate * up, self.w_down)
         return x, new_cache
 
@@ -187,13 +204,15 @@ class SmolLM:
 
     def enable_npu(
         self,
-        ops: tuple[str, ...] = ("wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down"),
+        ops: tuple[str, ...] = ("wqkv", "wo", "w_gate_up", "w_down"),
         softmax: bool = False,
         attention: bool = True,
     ) -> None:
         """Route NPU-offloadable layers. Each flag is independent.
 
-        - ops: projection matmuls (NpuLinear, weight-bf16).
+        - ops: projection matmuls (NpuLinear, weight-bf16). Default uses
+          fused QKV and gate/up projections — one dispatch each instead of
+          three/two — to amortise per-op driver overhead.
         - attention: fused FA (NpuAttention) replaces Q·K^T + softmax + ·V. Used
           for prefill only (T>1); decode falls back to CPU to avoid xclbin
           churn as Tk grows per token.

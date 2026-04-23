@@ -55,15 +55,20 @@ the end goal is Qwen3-27B/32B running efficiently on the same laptop.
 
   ```
   T    cpu(ms)  npu(ms)  ratio
-   16     40      324    0.122x
-   32     46      316    0.146x
-   64     77      349    0.221x
-  128    101      411    0.247x
+   16     47      346    0.135x
+   32     54      374    0.143x
+   64     67      339    0.198x
+  128     99      379    0.262x
   ```
 
   Session arc: four kernel optimisations (softmax vec → mmul Q·K^T →
   per-layer head batching → 4-core split). Kernel-only time for T=128
-  went 38.9 ms → 4.25 ms (9×); full end-to-end went 1400 ms → 411 ms (3.4×).
+  went 38.9 ms → 4.25 ms (9×); full end-to-end went 1400 ms → 379 ms (3.7×).
+- **Fused QKV + gate/up projections** — `Layer` pre-concats `[wq;wk;wv]` into
+  a single `[960, 576]` weight and `[w_gate; w_up]` into `[3072, 576]`; one
+  NPU dispatch replaces three + two per layer, saving 90 launches per
+  forward. ~8% win at T=128, flat at shorter T (FA + remaining projections
+  dominate there). Output is sliced on the N axis.
 - **Benchmarks** — at short prefill lengths NPU is still **slower** than CPU
   (~0.2× at L=16, ~0.9× at L=2048), fixed per-op dispatch overhead dominates.
   Useful prefill win starts needing less driver-Python overhead per op.
