@@ -119,7 +119,13 @@ class Layer:
             col = torch.arange(Tk, device=x.device)[None, :]
             mask = torch.where(col <= row, 0.0, float("-inf")).to(att.dtype)
             att = att + mask
-        att = F.softmax(att.float(), dim=-1).to(x.dtype)
+        # Softmax: prefill (T>1) goes to NPU if enabled, else CPU (fp32). Decode
+        # (T=1) always stays on CPU — rows would be tiny and the xclbin cache
+        # would mint a new one each step as Tk grows.
+        if self.npu is not None and "softmax" in self.npu and T > 1:
+            att = self.npu["softmax"](att).to(x.dtype)
+        else:
+            att = F.softmax(att.float(), dim=-1).to(x.dtype)
         o = torch.matmul(att, v_exp).transpose(1, 2).contiguous().view(B, T, Hq * Dh)
         x = x + self._lin("wo", o, self.wo)
         # --- MLP (SwiGLU) ---
@@ -141,11 +147,17 @@ class SmolLM:
         device = self.embed.device
         self.cos, self.sin = build_rope_cache(cfg.head_dim, cfg.max_pos, cfg.rope_theta, dtype, device)
 
-    def enable_npu(self, ops: tuple[str, ...] = ("wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down")) -> None:
-        """Route the named linear ops through NpuLinear on every layer.
+    def enable_npu(
+        self,
+        ops: tuple[str, ...] = ("wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down"),
+        softmax: bool = True,
+    ) -> None:
+        """Route the named linear ops (and optionally softmax) through NPU on every layer.
 
         NpuLinear lazily compiles xclbins per (M, K, N) — first forward triggers
         a burst of Peano/aiecc calls (~1-2s each). Weights are cast to bf16.
+        Softmax uses a single shared NpuSoftmax (no per-layer weights), keyed on
+        (rows, L) shape.
         """
         from npu.linear import NpuLinear  # local import to keep CPU path zero-cost
         # One NpuLinear per (layer, op) since weights differ per layer.
@@ -154,6 +166,11 @@ class SmolLM:
             for op in ops:
                 W = getattr(layer, op)
                 layer.npu[op] = NpuLinear(W)
+        if softmax:
+            from npu.softmax import NpuSoftmax
+            shared_softmax = NpuSoftmax(n_cores=1)
+            for layer in self.layers:
+                layer.npu["softmax"] = shared_softmax
 
     def forward(
         self,

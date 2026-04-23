@@ -23,6 +23,12 @@ the end goal is Qwen3-27B/32B running efficiently on the same laptop.
   Q/K/V/O/gate/up/down projection through `NpuLinear`. All 30 layers × 7 ops
   dispatched via 4 cached xclbins (K=576/N=576, K=576/N=192, K=576/N=1536,
   K=1536/N=576). **Top-1 token matches HF exactly** on test prompts.
+- **NPU softmax** (`npu/softmax.py`) — per-row bf16 softmax backed by the
+  stock `aie_kernels/aie2p/softmax.cc` via a thin wrapper that bakes the row
+  length in at compile time. One xclbin per `(rows, L_padded)`. Padded to
+  multiples of 32 (SM_VEC_LEN) with `-inf`. Enabled during **prefill only**
+  (T>1); decode keeps CPU softmax to avoid minting a new xclbin per step.
+  Top-1 token still matches HF exactly end-to-end.
 - **Benchmarks** — at short prefill lengths NPU is still **slower** than CPU
   (~0.2× at L=16, ~0.9× at L=2048), fixed per-op dispatch overhead dominates.
   Useful prefill win starts needing less driver-Python overhead per op.
@@ -40,6 +46,10 @@ npu/
   bench_matmul.py   — throughput sweep (tile sizes, dims)
   linear.py         — NpuLinear: torch-callable bf16 linear layer with
                       xclbin cache and persistent device buffers
+  softmax_kernel.cc — thin wrapper around aie_kernels/aie2p/softmax.cc that
+                      bakes SM_LEN at compile time
+  softmax.py        — NpuSoftmax: per-row bf16 softmax + IRON program +
+                      standalone self-test
   verify_layer.py   — compares NPU Q-projection output vs CPU inside one layer
   build/            — generated xclbins and object files (gitignored)
 vendor/             — gitignored
@@ -102,29 +112,23 @@ uv run python npu/matmul_mc.py -M 512 -K 512 -N 512 -m 32 -k 64 -n 32 --cols 4
   i.e. `M % (m·8) == 0` for the default tb layout. `NpuLinear.Plan` pads
   accordingly (minimum M_pad = 256 with `m=32`).
 
-## Next session — attention on NPU
+## Next session — finish attention on NPU
 
-Current NPU offload only handles the projection matmuls. The attention body
-(`Q·K^T`, softmax, `att·V`, output `o_proj`) still runs on CPU:
+The per-row softmax now runs on NPU (prefill path). The remaining attention
+pieces still on CPU: `Q·K^T`, `att·V`, and the fp32 cast around the softmax
+roundtrip (we currently do `att` in fp32 on CPU, cast to bf16 for NPU,
+cast back — this is a three-DMA dance).
 
-- `Q·K^T` has shape `[B, H, T, T]` — varies with `T`, doesn't fit the
-  fixed-shape xclbin model cleanly.
-- Softmax is per-row and numerically sensitive.
-- `att·V` is another `[B, H, T, T] · [B, H, T, Dh]`.
-
-`vendor/mlir-aie-src/aie_kernels/aie2p/` ships ready-made AIE2p kernels:
-`softmax.cc`, `layer_norm.cc`, `rms_norm.cc`, `rope.cc`, `silu.cc`,
-`swiglu.cc`, and `mm_bfp.cc` (block-fp ≈ int8 matmul). **These cover almost
-everything we still need** — the softmax kernel is the jump-in point for an
-NPU-resident attention.
-
-Suggested plan:
-1. Write a **FlashAttention-style kernel** that streams Q-blocks through a
-   compute tile and computes `softmax(Q·K^T)·V` with online rescaling, so
-   the `T²` intermediate never materialises.
-2. Alternative stepping stone: a standalone softmax kernel wrapped like
-   `NpuLinear`, used as a sanity test before tackling full FA.
-3. Once attention runs on NPU, measure end-to-end: the CPU↔NPU PCIe/DMA
-   roundtrip between projections and attention is currently a big cost.
+Steppingstones toward attention fully on NPU:
+1. **FlashAttention-style kernel** that streams Q-blocks through a compute
+   tile and computes `softmax(Q·K^T)·V` with online rescaling, so the `T²`
+   intermediate never materialises. The stock softmax kernel's 3-pass
+   structure is a good starting point to fuse with the two matmuls.
+2. **Decode-path softmax** — decode has T=1 and Tk growing by 1 per step,
+   which today mints a new xclbin per step. Either bucket Tk (pad to
+   multiples of 32 and reuse across a bucket) or unify to a single xclbin
+   that handles arbitrary Tk via a runtime loop count.
+3. **Multi-core softmax** — current kernel is single-core. Trivial to split
+   rows across 4 cores (rows = 9·T is easily divisible for most prefills).
 4. After attention — quantization path (`mm_bfp.cc`, int8 weights, 2×
    throughput + half the DMA). This is also the path toward Qwen3-27B.
