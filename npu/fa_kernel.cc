@@ -54,12 +54,13 @@ static inline float exp_scalar(float x) {
 // Persistent per-dispatch running state. g_O is bf16 (not fp32) to stay inside
 // the compute tile's .bss budget; each block update casts to fp32 locally,
 // does the rescale+MAC, and casts back — precision loss is per-update bf16,
-// which the end-to-end self-test accepts at ~1e-2.
+// which the end-to-end self-test accepts at ~1e-2. alignas because g_m and
+// g_O are loaded as BR-lane fp32 / BR×DH bf16 vectors in the hot loop.
 static int   g_block_idx = 0;
 static int   g_start_row = 0;
 static int   g_causal    = 0;
-static float g_m[BR];
-static float g_l[BR];
+alignas(64) static float g_m[BR];
+alignas(64) static float g_l[BR];
 alignas(64) static bfloat16 g_O[BR * DH];
 
 extern "C" {
@@ -83,10 +84,9 @@ void attn_block(bfloat16 *restrict Q_with_header, bfloat16 *restrict KV) {
   bfloat16 *V = KV + BC * DH;
   const int start_col = g_block_idx * BC;
 
-  // S = Q · K^T · inv_sqrt_d. DH=64 splits into two 32-lane vector halves
-  // (512-bit is the native AIE vector width), each r/c pair: 2 loads per operand,
-  // 1 mul + 1 mac + reduce_add. 1024 vector ops total vs 65K scalar.
-  alignas(64) float S[BR * BC];
+  // S = Q · K^T · inv_sqrt_d stored bf16 (BC=32 fits the native SIMD width,
+  // so softmax below can consume each row as one vector load).
+  alignas(64) bfloat16 S[BR * BC];
   for (int r = 0; r < BR; ++r) {
     aie::vector<bfloat16, 32> q0 = aie::load_v<32>(&Q[r * DH]);
     aie::vector<bfloat16, 32> q1 = aie::load_v<32>(&Q[r * DH + 32]);
@@ -95,48 +95,50 @@ void attn_block(bfloat16 *restrict Q_with_header, bfloat16 *restrict KV) {
       aie::vector<bfloat16, 32> k1 = aie::load_v<32>(&K[c * DH + 32]);
       aie::accum<accfloat, 32> acc = aie::mul(q0, k0);
       acc = aie::mac(acc, q1, k1);
-      S[r * BC + c] = aie::reduce_add(acc.to_vector<float>()) * INV_SQRT_D;
+      float dot = aie::reduce_add(acc.to_vector<float>()) * INV_SQRT_D;
+      S[r * BC + c] = (bfloat16)dot;
     }
   }
 
-  // Causal mask: row r (abs pos g_start_row+r) can attend to col c
-  // (abs pos start_col+c) iff start_col+c <= g_start_row+r. Masked elements
-  // become -INFINITY so they contribute 0 to the row-max and to exp downstream.
+  // Causal mask: set S[r, c] = -inf where start_col+c > g_start_row+r.
   if (g_causal) {
     for (int r = 0; r < BR; ++r) {
       int row_pos = g_start_row + r;
       for (int c = 0; c < BC; ++c) {
         if (start_col + c > row_pos) {
-          S[r * BC + c] = -INFINITY;
+          S[r * BC + c] = (bfloat16)(-INFINITY);
         }
       }
     }
   }
 
+  // Row-wise online softmax, vectorised over BC. Per row: 1 reduce_max,
+  // 1 vector mul (scale by log2e), 1 vector sub, 1 vector exp2, 1 vector
+  // store, 1 reduce_add. Alpha uses the scalar exp_scalar helper — the
+  // two-pass vectorise-alpha attempt was a net regression (~+2.5ms),
+  // probably from lost instruction-level parallelism across iterations.
+  const aie::vector<bfloat16, BC> log2e_v = aie::broadcast<bfloat16, BC>((bfloat16)LOG2E);
   for (int r = 0; r < BR; ++r) {
-    float m_local = S[r * BC];
-    for (int c = 1; c < BC; ++c) {
-      float v = S[r * BC + c];
-      if (v > m_local) m_local = v;
-    }
-    float m_prev = g_m[r];
-    float m_new  = (m_prev > m_local) ? m_prev : m_local;
-    // Fully-masked row this block AND no prior keys: leave state untouched.
-    // Can happen under causal mask when start_col > row_pos (block entirely
-    // past the causal frontier for this row).
+    aie::vector<bfloat16, BC> s_v = aie::load_v<BC>(&S[r * BC]);
+    bfloat16 m_local_bf = aie::reduce_max(s_v);
+    float m_local = (float)m_local_bf;
+    float m_prev  = g_m[r];
+    float m_new   = (m_prev > m_local) ? m_prev : m_local;
     if (m_new == -INFINITY) continue;
 
     float alpha = (m_prev == -INFINITY) ? 0.0f : exp_scalar(m_prev - m_new);
 
-    // P_row = exp(S[r, :] - m_new). Keep both bf16 (for the S·V vector MAC)
-    // and a running fp32 sum for l[r].
+    aie::accum<accfloat, BC> scaled_acc = aie::mul(s_v, log2e_v);
+    aie::vector<bfloat16, BC> m_new_scaled_v =
+        aie::broadcast<bfloat16, BC>((bfloat16)(m_new * LOG2E));
+    aie::accum<accfloat, BC> diff_acc = aie::sub(scaled_acc, m_new_scaled_v);
+    aie::vector<bfloat16, BC> P_v = aie::exp2<bfloat16>(diff_acc.to_vector<float>());
+
     alignas(64) bfloat16 P_row[BC];
-    float row_sum = 0.0f;
-    for (int c = 0; c < BC; ++c) {
-      float e = exp_scalar(S[r * BC + c] - m_new);
-      P_row[c] = (bfloat16)e;
-      row_sum += e;
-    }
+    aie::store_v(&P_row[0], P_v);
+    aie::accum<accfloat, BC> P_acc = aie::mul(P_v, aie::broadcast<bfloat16, BC>((bfloat16)1.0f));
+    float row_sum = aie::reduce_add(P_acc.to_vector<float>());
+
     g_l[r] = alpha * g_l[r] + row_sum;
 
     // O[r, :] = alpha · O[r, :] + P_row @ V. Output row spans DH=64 lanes,
