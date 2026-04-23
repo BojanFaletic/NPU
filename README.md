@@ -40,10 +40,16 @@ the end goal is Qwen3-27B/32B running efficiently on the same laptop.
   dispatch processes one Q block (BR=32 rows) attending to all TK keys.
   Host streams n_kv = TK/BC (BC=32) key/value block pairs; kernel keeps
   running softmax state (row-max, row-sum, output accumulator) in static
-  tile memory so the [BR, TK] intermediate never materialises. Tile DMEM
-  footprint is constant in TK (~37 KB). Tested TK ∈ {64, 128, 256, 512}:
-  all trials match torch attention to bf16 precision
-  (max|Δ|≈1.5-2.9e-2, mean|Δ|≈2-4e-3). No causal mask yet.
+  tile memory so the [BR, TK] intermediate never materialises. Causal
+  mask supported via a tiny header in the Q buffer (`start_row` +
+  `causal` flag). Tested TK up to 512 with causal, max|Δ|≈4.7e-2.
+- **SmolLM integration**: `smollm.py --npu` enables FA for prefill (T>1),
+  dispatching once per (head, Q-block). **Top-1 matches HF exactly** on
+  tested prompts. Per-token speed is a heavy regression — 30-180× slower
+  than CPU at T=8..128 — because each forward pass issues 270-1080 small
+  dispatches, dominated by the Python dispatch loop and the scalar
+  matmul kernel. Compute-vectorisation (aie::mmul) and per-layer
+  head-batching are the two outstanding leverages.
 - **Benchmarks** — at short prefill lengths NPU is still **slower** than CPU
   (~0.2× at L=16, ~0.9× at L=2048), fixed per-op dispatch overhead dominates.
   Useful prefill win starts needing less driver-Python overhead per op.

@@ -82,6 +82,43 @@ class Layer:
             return self.npu[name](x)
         return F.linear(x, W)
 
+    def _fa_attention(
+        self, q, k_exp, v_exp, start_pos: int,
+        B: int, T: int, Tk: int, Hq: int, Dh: int,
+    ) -> torch.Tensor:
+        """Run NPU FlashAttention per (batch, head, Q-block); return `o` [B, T, Hq*Dh].
+
+        Pads T up to multiple of BR and Tk up to multiple of BC. Causal mask
+        inside the kernel handles both the real causal boundary and the padded
+        lanes (padded K cols at positions >= Tk are past every real Q row's
+        causal frontier).
+        """
+        attn = self.npu["attention"]
+        BR, BC = attn.BR, attn.BC
+        Tq_pad = ((T  + BR - 1) // BR) * BR
+        Tk_pad = ((Tk + BC - 1) // BC) * BC
+
+        if Tq_pad > T:
+            q = torch.cat([q, q.new_zeros(B, Hq, Tq_pad - T, Dh)], dim=2)
+        if Tk_pad > Tk:
+            k_exp = torch.cat([k_exp, k_exp.new_zeros(B, Hq, Tk_pad - Tk, Dh)], dim=2)
+            v_exp = torch.cat([v_exp, v_exp.new_zeros(B, Hq, Tk_pad - Tk, Dh)], dim=2)
+
+        O_pad = q.new_zeros(B, Hq, Tq_pad, Dh)
+        for b in range(B):
+            for h in range(Hq):
+                Kh = k_exp[b, h].contiguous()
+                Vh = v_exp[b, h].contiguous()
+                for i in range(Tq_pad // BR):
+                    Qi = q[b, h, i*BR:(i+1)*BR].contiguous()
+                    O_pad[b, h, i*BR:(i+1)*BR] = attn.run_one(
+                        Qi, Kh, Vh,
+                        start_row=i * BR + start_pos,
+                        causal=True,
+                    ).float()
+
+        return O_pad[:, :, :T, :].transpose(1, 2).contiguous().view(B, T, Hq * Dh)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -110,23 +147,23 @@ class Layer:
         k_exp = k.repeat_interleave(rep, dim=1)
         v_exp = v.repeat_interleave(rep, dim=1)
         Tk = k_exp.shape[2]
-        # causal attention. For decode (T=1) no mask needed; for prefill, mask is causal.
-        att = torch.matmul(q, k_exp.transpose(-2, -1)) / math.sqrt(Dh)  # [B, Hq, T, Tk]
-        if T > 1:
-            # position i in q attends to positions [0, start_pos + i] in k
-            # simplest: build a [T, Tk] mask
-            row = torch.arange(T, device=x.device)[:, None] + start_pos
-            col = torch.arange(Tk, device=x.device)[None, :]
-            mask = torch.where(col <= row, 0.0, float("-inf")).to(att.dtype)
-            att = att + mask
-        # Softmax: prefill (T>1) goes to NPU if enabled, else CPU (fp32). Decode
-        # (T=1) always stays on CPU — rows would be tiny and the xclbin cache
-        # would mint a new one each step as Tk grows.
-        if self.npu is not None and "softmax" in self.npu and T > 1:
-            att = self.npu["softmax"](att).to(x.dtype)
+        # Prefill (T>1) can route the whole attention body through a single
+        # fused FA kernel. Decode (T=1) stays on CPU — one dispatch per token
+        # with varying start_pos would mint a new xclbin each step as Tk grows.
+        if self.npu is not None and "attention" in self.npu and T > 1:
+            o = self._fa_attention(q, k_exp, v_exp, start_pos, B, T, Tk, Hq, Dh)
         else:
-            att = F.softmax(att.float(), dim=-1).to(x.dtype)
-        o = torch.matmul(att, v_exp).transpose(1, 2).contiguous().view(B, T, Hq * Dh)
+            att = torch.matmul(q, k_exp.transpose(-2, -1)) / math.sqrt(Dh)  # [B, Hq, T, Tk]
+            if T > 1:
+                row = torch.arange(T, device=x.device)[:, None] + start_pos
+                col = torch.arange(Tk, device=x.device)[None, :]
+                mask = torch.where(col <= row, 0.0, float("-inf")).to(att.dtype)
+                att = att + mask
+            if self.npu is not None and "softmax" in self.npu and T > 1:
+                att = self.npu["softmax"](att).to(x.dtype)
+            else:
+                att = F.softmax(att.float(), dim=-1).to(x.dtype)
+            o = torch.matmul(att, v_exp).transpose(1, 2).contiguous().view(B, T, Hq * Dh)
         x = x + self._lin("wo", o, self.wo)
         # --- MLP (SwiGLU) ---
         h = rms_norm(x, self.ln2, cfg.rms_eps)
@@ -150,17 +187,20 @@ class SmolLM:
     def enable_npu(
         self,
         ops: tuple[str, ...] = ("wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down"),
-        softmax: bool = True,
+        softmax: bool = False,
+        attention: bool = True,
     ) -> None:
-        """Route the named linear ops (and optionally softmax) through NPU on every layer.
+        """Route NPU-offloadable layers. Each flag is independent.
 
-        NpuLinear lazily compiles xclbins per (M, K, N) — first forward triggers
-        a burst of Peano/aiecc calls (~1-2s each). Weights are cast to bf16.
-        Softmax uses a single shared NpuSoftmax (no per-layer weights), keyed on
-        (rows, L) shape.
+        - ops: projection matmuls (NpuLinear, weight-bf16).
+        - attention: fused FA (NpuAttention) replaces Q·K^T + softmax + ·V. Used
+          for prefill only (T>1); decode falls back to CPU to avoid xclbin
+          churn as Tk grows per token.
+        - softmax: the old standalone NPU softmax path (projection-matmul +
+          softmax, leaves Q·K^T and ·V on CPU). Kept available for comparison
+          but a net regression end-to-end vs attention=True.
         """
         from npu.linear import NpuLinear  # local import to keep CPU path zero-cost
-        # One NpuLinear per (layer, op) since weights differ per layer.
         for layer in self.layers:
             layer.npu = {}
             for op in ops:
@@ -171,6 +211,11 @@ class SmolLM:
             shared_softmax = NpuSoftmax(n_cores=1)
             for layer in self.layers:
                 layer.npu["softmax"] = shared_softmax
+        if attention:
+            from npu.fa import NpuAttention
+            shared_fa = NpuAttention(BR=32, BC=32, D=self.cfg.head_dim)
+            for layer in self.layers:
+                layer.npu["attention"] = shared_fa
 
     def forward(
         self,

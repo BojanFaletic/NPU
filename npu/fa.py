@@ -43,10 +43,14 @@ def compile_kernel(BR: int, BC: int, D: int, build_dir: Path) -> Path:
     return obj
 
 
-def generate_mlir(BR: int, BC: int, D: int, n_kv: int, obj_name: str, out_path: Path) -> None:
-    """Two input FIFOs (Q once + KV-pairs streamed n_kv times) -> one output (O).
+HEADER_BF16 = 32  # matches fa_kernel.cc; header riding in Q buffer
 
-    Compute tiles have a 2-input DMA channel limit, so we pair K and V into
+
+def generate_mlir(BR: int, BC: int, D: int, n_kv: int, obj_name: str, out_path: Path) -> None:
+    """Two input FIFOs (Q+header once + KV-pairs streamed n_kv times) -> O.
+
+    Compute tiles have a 2-input DMA channel limit, so Q carries start_row and
+    the causal flag inline in its first 32 bf16 lanes, and K/V are paired into
     one streaming FIFO (each tile is [K | V] concatenated, 2·BC·D bf16).
     """
     from ml_dtypes import bfloat16 as np_bf16
@@ -55,17 +59,15 @@ def generate_mlir(BR: int, BC: int, D: int, n_kv: int, obj_name: str, out_path: 
     from aie.iron.device import NPU2
     from aie.iron.placers import SequentialPlacer
 
-    q_len  = BR * D
-    kv_len = 2 * BC * D  # K block followed by V block
+    q_len  = HEADER_BF16 + BR * D
+    kv_len = 2 * BC * D
     o_len  = BR * D
 
     q_ty  = np.ndarray[(q_len,),  np.dtype[np_bf16]]
     kv_ty = np.ndarray[(kv_len,), np.dtype[np_bf16]]
     o_ty  = np.ndarray[(o_len,),  np.dtype[np_bf16]]
-    # Runtime outer-buffer types: Q is one block (BR*D), KV stream is n_kv pairs.
     kv_stream_ty = np.ndarray[(n_kv * kv_len,), np.dtype[np_bf16]]
 
-    init_k     = Kernel("attn_init",     obj_name, [])
     block_k    = Kernel("attn_block",    obj_name, [q_ty, kv_ty])
     finalise_k = Kernel("attn_finalise", obj_name, [o_ty])
 
@@ -73,10 +75,9 @@ def generate_mlir(BR: int, BC: int, D: int, n_kv: int, obj_name: str, out_path: 
     fifo_kv = ObjectFifo(kv_ty, name="inKV")
     fifo_o  = ObjectFifo(o_ty,  name="outO")
 
-    def core_fn(of_q, of_kv, of_o, attn_init, attn_block, attn_finalise):
+    def core_fn(of_q, of_kv, of_o, attn_block, attn_finalise):
         elem_o = of_o.acquire(1)
         elem_q = of_q.acquire(1)
-        attn_init()
         for _ in range_(n_kv) if n_kv > 1 else range(1):
             elem_kv = of_kv.acquire(1)
             attn_block(elem_q, elem_kv)
@@ -87,8 +88,8 @@ def generate_mlir(BR: int, BC: int, D: int, n_kv: int, obj_name: str, out_path: 
 
     worker = Worker(
         core_fn,
-        fn_args=[fifo_q.cons(), fifo_kv.cons(), fifo_o.prod(), init_k, block_k, finalise_k],
-        # 2KB state (g_O[BR*DH=32*64] fp32) + scratch S[BR*BC] fp32 + call frames
+        fn_args=[fifo_q.cons(), fifo_kv.cons(), fifo_o.prod(), block_k, finalise_k],
+        # g_O[BR*DH] fp32 = 8KB static + S[BR*BC] fp32 = 4KB stack + call frames
         stack_size=0x3000,
     )
 
@@ -161,8 +162,16 @@ class NpuAttention:
         self._kernel_cache[c.xclbin_path] = (xb, ctx, kernel, bo_instr)
         return self._kernel_cache[c.xclbin_path]
 
-    def run_one(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-        """Q [BR, D], K [TK, D], V [TK, D], TK multiple of BC. Returns O [BR, D] bf16."""
+    def run_one(
+        self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
+        start_row: int = 0, causal: bool = False,
+    ) -> torch.Tensor:
+        """Q [BR, D], K [TK, D], V [TK, D], TK multiple of BC. Returns O [BR, D] bf16.
+
+        start_row is the absolute position of Q row 0 in the full sequence; it
+        drives the causal mask alongside the block index. Used when Tq > BR and
+        this call is handling a middle Q block (rows start_row..start_row+BR-1).
+        """
         import pyxrt
         BR, D = Q.shape
         TK = K.shape[0]
@@ -178,7 +187,7 @@ class NpuAttention:
         dev = self._device_obj()
         _, _, kernel, bo_instr = self._kernel_for(c)
 
-        q_bytes  = BR * D * 2
+        q_bytes  = (HEADER_BF16 + BR * D) * 2  # header + Q data, bf16
         kv_bytes = n_kv * 2 * BC * D * 2
         o_bytes  = BR * D * 2
         if n_kv not in self._bo:
@@ -188,12 +197,15 @@ class NpuAttention:
             self._bo[n_kv] = (bo_q, bo_kv, bo_o)
         bo_q, bo_kv, bo_o = self._bo[n_kv]
 
-        # Q payload
-        q_arr = _bf16_to_u16(Q.to(torch.bfloat16).contiguous()).reshape(-1)
+        # Q buffer = header (start_row, causal, padding) + Q data
+        header = torch.zeros(HEADER_BF16, dtype=torch.bfloat16)
+        header[0] = float(start_row)
+        header[1] = 1.0 if causal else 0.0
+        q_payload = torch.cat([header, Q.to(torch.bfloat16).contiguous().reshape(-1)])
+        q_arr = _bf16_to_u16(q_payload).reshape(-1)
         bo_q.write(q_arr.tobytes(), 0)
         bo_q.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
-        # KV stream: interleave K block j, V block j, K block j+1, V block j+1, ...
         K_bf = K.to(torch.bfloat16).contiguous()
         V_bf = V.to(torch.bfloat16).contiguous()
         kv_blocks = []
@@ -222,7 +234,25 @@ def _torch_attention_nomask(Q, K, V):
     return A @ V.float()
 
 
-def _self_test(BR: int, BC: int, D: int, TK: int, n_trials: int) -> None:
+def _torch_causal_attention(Q, K, V, start_row: int):
+    """Standard-attention reference (what smollm.py computes on CPU path).
+
+    Q rows map to absolute positions [start_row, start_row+BR); K cols to [0, TK).
+    Causal mask: col c attends to row r iff c <= start_row + r.
+    """
+    Tq = Q.shape[0]
+    Tk = K.shape[0]
+    D = Q.shape[-1]
+    S = (Q.float() @ K.float().transpose(-2, -1)) / math.sqrt(D)
+    row = torch.arange(Tq)[:, None] + start_row
+    col = torch.arange(Tk)[None, :]
+    mask = torch.where(col <= row, 0.0, float("-inf")).to(S.dtype)
+    S = S + mask
+    A = torch.softmax(S, dim=-1)
+    return A @ V.float()
+
+
+def _self_test(BR: int, BC: int, D: int, TK: int, n_trials: int, causal: bool) -> None:
     torch.manual_seed(0)
     attn = NpuAttention(BR=BR, BC=BC, D=D)
     fail = []
@@ -231,8 +261,14 @@ def _self_test(BR: int, BC: int, D: int, TK: int, n_trials: int) -> None:
         K = torch.randn(TK, D, dtype=torch.bfloat16)
         V = torch.randn(TK, D, dtype=torch.bfloat16)
 
-        O_npu = attn.run_one(Q, K, V).float()
-        O_ref = _torch_attention_nomask(Q, K, V)
+        # For causal, vary start_row per trial so we exercise partial masks.
+        start_row = (trial * BR) % max(TK, BR) if causal else 0
+
+        O_npu = attn.run_one(Q, K, V, start_row=start_row, causal=causal).float()
+        if causal:
+            O_ref = _torch_causal_attention(Q, K, V, start_row=start_row)
+        else:
+            O_ref = _torch_attention_nomask(Q, K, V)
 
         nan = torch.isnan(O_npu).any().item()
         inf = torch.isinf(O_npu).any().item()
@@ -240,13 +276,15 @@ def _self_test(BR: int, BC: int, D: int, TK: int, n_trials: int) -> None:
         max_abs = float("nan") if nan or inf else d.max().item()
         mean_abs = float("nan") if nan or inf else d.mean().item()
         flag = ("NaN!" if nan else "") + ("Inf!" if inf else "")
-        print(f"  trial {trial}: max|Δ|={max_abs:.3e}  mean|Δ|={mean_abs:.3e}  {flag}")
+        tag = f"causal sr={start_row}" if causal else "nomask"
+        print(f"  trial {trial} [{tag}]: max|Δ|={max_abs:.3e}  mean|Δ|={mean_abs:.3e}  {flag}")
         if nan or inf or (max_abs > 1e-1):
             fail.append(trial)
 
     if fail:
         raise AssertionError(f"{len(fail)}/{n_trials} trials failed: {fail}")
-    print(f"NpuAttention BR={BR} BC={BC} D={D} TK={TK} (n_kv={TK//BC}): all {n_trials} trials OK")
+    print(f"NpuAttention BR={BR} BC={BC} D={D} TK={TK} (n_kv={TK//BC}) "
+          f"causal={causal}: all {n_trials} trials OK")
 
 
 def main():
@@ -256,8 +294,9 @@ def main():
     ap.add_argument("-D",  type=int, default=64)
     ap.add_argument("--TK", type=int, default=64)
     ap.add_argument("--trials", type=int, default=5)
+    ap.add_argument("--causal", action="store_true")
     args = ap.parse_args()
-    _self_test(args.BR, args.BC, args.D, args.TK, args.trials)
+    _self_test(args.BR, args.BC, args.D, args.TK, args.trials, args.causal)
 
 
 if __name__ == "__main__":
