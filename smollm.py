@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
+from npu.profiler import profile
+
 MODEL_ID = "HuggingFaceTB/SmolLM2-135M"
 
 
@@ -28,10 +30,11 @@ class Config:
 
 
 def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
-    # compute in fp32 for stability (matches HF)
+    # compute in fp32 for stability (matches HF); return in x.dtype regardless
+    # of w.dtype so the residual stream keeps its dtype end-to-end.
     x_f = x.float()
     rms = x_f.pow(2).mean(-1, keepdim=True).add(eps).rsqrt()
-    return (x_f * rms).to(x.dtype) * w
+    return ((x_f * rms) * w.float()).to(x.dtype)
 
 
 def build_rope_cache(head_dim: int, max_pos: int, theta: float, dtype, device):
@@ -136,58 +139,63 @@ class Layer:
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         B, T, D = x.shape
         Hq, Hkv, Dh = cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
-        h = rms_norm(x, self.ln1, cfg.rms_eps)
-        if self.npu is not None and "wqkv" in self.npu:
-            qkv = self.npu["wqkv"](h)
-            Nq, Nk = Hq * Dh, Hkv * Dh
-            q = qkv[..., :Nq].view(B, T, Hq,  Dh).transpose(1, 2)
-            k = qkv[..., Nq:Nq + Nk].view(B, T, Hkv, Dh).transpose(1, 2)
-            v = qkv[..., Nq + Nk:].view(B, T, Hkv, Dh).transpose(1, 2)
-        else:
-            q = self._lin("wq", h, self.wq).view(B, T, Hq,  Dh).transpose(1, 2)
-            k = self._lin("wk", h, self.wk).view(B, T, Hkv, Dh).transpose(1, 2)
-            v = self._lin("wv", h, self.wv).view(B, T, Hkv, Dh).transpose(1, 2)
-        # RoPE uses absolute positions [start_pos, start_pos + T)
-        q = apply_rope(q, cos[start_pos:start_pos + T], sin[start_pos:start_pos + T])
-        k = apply_rope(k, cos[start_pos:start_pos + T], sin[start_pos:start_pos + T])
-        # append to cache
-        if past is not None:
-            k = torch.cat([past[0], k], dim=2)
-            v = torch.cat([past[1], v], dim=2)
-        new_cache = (k, v)
-        # GQA: repeat kv to match q heads (post-concat, so cache stays compact)
-        rep = Hq // Hkv
-        k_exp = k.repeat_interleave(rep, dim=1)
-        v_exp = v.repeat_interleave(rep, dim=1)
-        Tk = k_exp.shape[2]
+        with profile("rms1"):
+            h = rms_norm(x, self.ln1, cfg.rms_eps)
+        with profile("qkv"):
+            if self.npu is not None and "wqkv" in self.npu:
+                qkv = self.npu["wqkv"](h)
+                Nq, Nk = Hq * Dh, Hkv * Dh
+                q = qkv[..., :Nq].view(B, T, Hq,  Dh).transpose(1, 2)
+                k = qkv[..., Nq:Nq + Nk].view(B, T, Hkv, Dh).transpose(1, 2)
+                v = qkv[..., Nq + Nk:].view(B, T, Hkv, Dh).transpose(1, 2)
+            else:
+                q = self._lin("wq", h, self.wq).view(B, T, Hq,  Dh).transpose(1, 2)
+                k = self._lin("wk", h, self.wk).view(B, T, Hkv, Dh).transpose(1, 2)
+                v = self._lin("wv", h, self.wv).view(B, T, Hkv, Dh).transpose(1, 2)
+        with profile("rope"):
+            q = apply_rope(q, cos[start_pos:start_pos + T], sin[start_pos:start_pos + T])
+            k = apply_rope(k, cos[start_pos:start_pos + T], sin[start_pos:start_pos + T])
+            if past is not None:
+                k = torch.cat([past[0], k], dim=2)
+                v = torch.cat([past[1], v], dim=2)
+            new_cache = (k, v)
+            rep = Hq // Hkv
+            k_exp = k.repeat_interleave(rep, dim=1)
+            v_exp = v.repeat_interleave(rep, dim=1)
+            Tk = k_exp.shape[2]
         # Prefill (T>1) can route the whole attention body through a single
         # fused FA kernel. Decode (T=1) stays on CPU — one dispatch per token
         # with varying start_pos would mint a new xclbin each step as Tk grows.
         if self.npu is not None and "attention" in self.npu and T > 1:
-            o = self._fa_attention(q, k_exp, v_exp, start_pos, B, T, Tk, Hq, Dh)
+            with profile("attn_npu"):
+                o = self._fa_attention(q, k_exp, v_exp, start_pos, B, T, Tk, Hq, Dh)
         else:
-            att = torch.matmul(q, k_exp.transpose(-2, -1)) / math.sqrt(Dh)  # [B, Hq, T, Tk]
-            if T > 1:
-                row = torch.arange(T, device=x.device)[:, None] + start_pos
-                col = torch.arange(Tk, device=x.device)[None, :]
-                mask = torch.where(col <= row, 0.0, float("-inf")).to(att.dtype)
-                att = att + mask
-            if self.npu is not None and "softmax" in self.npu and T > 1:
-                att = self.npu["softmax"](att).to(x.dtype)
+            with profile("attn_cpu"):
+                att = torch.matmul(q, k_exp.transpose(-2, -1)) / math.sqrt(Dh)
+                if T > 1:
+                    row = torch.arange(T, device=x.device)[:, None] + start_pos
+                    col = torch.arange(Tk, device=x.device)[None, :]
+                    mask = torch.where(col <= row, 0.0, float("-inf")).to(att.dtype)
+                    att = att + mask
+                if self.npu is not None and "softmax" in self.npu and T > 1:
+                    att = self.npu["softmax"](att).to(x.dtype)
+                else:
+                    att = F.softmax(att.float(), dim=-1).to(x.dtype)
+                o = torch.matmul(att, v_exp).transpose(1, 2).contiguous().view(B, T, Hq * Dh)
+        with profile("wo"):
+            x = x + self._lin("wo", o, self.wo)
+        with profile("rms2"):
+            h = rms_norm(x, self.ln2, cfg.rms_eps)
+        with profile("gate_up"):
+            if self.npu is not None and "w_gate_up" in self.npu:
+                gu = self.npu["w_gate_up"](h)
+                gate = F.silu(gu[..., :cfg.ffn_dim])
+                up = gu[..., cfg.ffn_dim:]
             else:
-                att = F.softmax(att.float(), dim=-1).to(x.dtype)
-            o = torch.matmul(att, v_exp).transpose(1, 2).contiguous().view(B, T, Hq * Dh)
-        x = x + self._lin("wo", o, self.wo)
-        # --- MLP (SwiGLU) ---
-        h = rms_norm(x, self.ln2, cfg.rms_eps)
-        if self.npu is not None and "w_gate_up" in self.npu:
-            gu = self.npu["w_gate_up"](h)
-            gate = F.silu(gu[..., :cfg.ffn_dim])
-            up = gu[..., cfg.ffn_dim:]
-        else:
-            gate = F.silu(self._lin("w_gate", h, self.w_gate))
-            up = self._lin("w_up", h, self.w_up)
-        x = x + self._lin("w_down", gate * up, self.w_down)
+                gate = F.silu(self._lin("w_gate", h, self.w_gate))
+                up = self._lin("w_up", h, self.w_up)
+        with profile("w_down"):
+            x = x + self._lin("w_down", gate * up, self.w_down)
         return x, new_cache
 
 

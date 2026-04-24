@@ -35,8 +35,19 @@ class Plan:
     M_pad: int; N_pad: int           # padded outer dims
 
     @classmethod
-    def make(cls, M: int, K: int, N: int) -> "Plan":
-        """Pick tile + col count that fit our constraints, minimise padding."""
+    def make(cls, M: int, K: int, N: int, force_N_pad: int | None = None) -> "Plan":
+        """Pick tile + col count that fit our constraints, minimise padding.
+
+        When `force_N_pad` is given, round N_pad up to it (must be >= N and
+        satisfy the N_pad % (n*cols) divisibility). This lets multiple
+        NpuLinears with different out-features share a single xclbin: the
+        driver avoids an expensive hw_context/kernel switch between them, at
+        the cost of some padded compute on the narrower weights. The concrete
+        trade-off is tested empirically — with 4 SmolLM projection shapes a
+        round-robin call pattern costs 2.56× more per call than single-shape,
+        so folding three K=576 projections into one shared (K=576, N=3072)
+        xclbin is a net win even with 3-5× compute inflation on wqkv/wo.
+        """
         # Constraints (whole_array_iron.py):
         #   M_pad must divide evenly into (m * n_aie_rows * tb_n_rows) blocks
         #     where n_aie_rows=4, tb_n_rows=tb_max_n_rows//2=2  =>  M_step = m*8
@@ -47,16 +58,24 @@ class Plan:
         best: Plan | None = None
         for cols in (8, 4, 2, 1):
             N_step = n * cols
-            N_pad = (N + N_step - 1) // N_step * N_step
+            if force_N_pad is not None:
+                if force_N_pad < N or force_N_pad % N_step != 0:
+                    continue
+                N_pad = force_N_pad
+            else:
+                N_pad = (N + N_step - 1) // N_step * N_step
             M_step = m * 4 * 2  # m * n_aie_rows * tb_n_rows
             M_pad = (M + M_step - 1) // M_step * M_step
             if K % k != 0:
                 continue
-            # Score: minimise total padded ops
             score = M_pad * N_pad
             if best is None or score < best.M_pad * best.N_pad or (score == best.M_pad * best.N_pad and cols > best.cols):
                 best = cls(M=M, K=K, N=N, m=m, k=k, n=n, cols=cols, M_pad=M_pad, N_pad=N_pad)
-        assert best is not None, f"no valid plan for shape M={M} K={K} N={N} (K must be multiple of 64)"
+        assert best is not None, (
+            f"no valid plan for shape M={M} K={K} N={N} force_N_pad={force_N_pad} "
+            f"(K must be multiple of 64; force_N_pad must be reachable by some "
+            f"(n*cols) divisor)"
+        )
         return best
 
 
@@ -133,9 +152,13 @@ class NpuLinear:
     batch/time dims are flattened before dispatch and un-flattened after.
     """
 
-    def __init__(self, weight: torch.Tensor):
+    def __init__(self, weight: torch.Tensor, share_N_pad: int | None = None):
+        """weight: [out, in]. share_N_pad: if set, force the xclbin's padded
+        N dim to this value so multiple NpuLinears with different out_features
+        (but same K) compile to / reuse the same xclbin. See Plan.make."""
         assert weight.dim() == 2, "expected [out, in]"
         self.out_features, self.in_features = weight.shape
+        self.share_N_pad = share_N_pad
         # bf16 weight, transposed so dispatched matmul is A @ B (not A @ B.T).
         self._W = weight.to(torch.bfloat16).t().contiguous()  # shape [in, out]
         # Per-M compiled kernel + preallocated device buffers.
@@ -148,7 +171,8 @@ class NpuLinear:
 
     def _plan_for(self, M: int) -> Compiled:
         if M not in self._compiled:
-            plan = Plan.make(M=M, K=self.in_features, N=self.out_features)
+            plan = Plan.make(M=M, K=self.in_features, N=self.out_features,
+                             force_N_pad=self.share_N_pad)
             self._compiled[M] = _build_xclbin(plan)
         return self._compiled[M]
 
@@ -167,6 +191,7 @@ class NpuLinear:
         return B
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        from npu.profiler import profile  # same module instance as bench/smollm
         orig_shape = x.shape
         x2 = x.reshape(-1, self.in_features)
         M = x2.shape[0]
@@ -195,23 +220,26 @@ class NpuLinear:
             self._bo_a[M] = bo_a
             self._bo_c[M] = bo_c
 
-        # --- pad A and upload ---
-        A_bf = x2.to(torch.bfloat16).contiguous()
-        if plan.M_pad != M:
-            A_bf = torch.cat(
-                [A_bf, torch.zeros(plan.M_pad - M, plan.K, dtype=torch.bfloat16)], dim=0)
-        a_np = _bf16_to_u16(A_bf).reshape(-1)
-        bo_a.write(a_np.tobytes(), 0)
-        bo_a.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-
-        run = kernel(3, bo_instr, c.insts.size, bo_a, bo_b, bo_c)
-        run.wait()
-
-        bo_c.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
-        c_out = np.frombuffer(bytes(bo_c.read(plan.M_pad * plan.N_pad * 4, 0)), dtype=np.float32)
-        c_out = c_out.reshape(plan.M_pad, plan.N_pad)[:M, :self.out_features].copy()
-
-        return torch.from_numpy(c_out).reshape(*orig_shape[:-1], self.out_features)
+        with profile("lin.bf16"):
+            A_bf = x2.to(torch.bfloat16).contiguous()
+            if plan.M_pad != M:
+                A_bf = torch.cat(
+                    [A_bf, torch.zeros(plan.M_pad - M, plan.K, dtype=torch.bfloat16)], dim=0)
+            a_np = _bf16_to_u16(A_bf).reshape(-1)
+        with profile("lin.write"):
+            bo_a.write(a_np.tobytes(), 0)
+        with profile("lin.sync_to"):
+            bo_a.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+        with profile("lin.kernel"):
+            run = kernel(3, bo_instr, c.insts.size, bo_a, bo_b, bo_c)
+            run.wait()
+        with profile("lin.sync_from"):
+            bo_c.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+        with profile("lin.read"):
+            c_out = np.frombuffer(bytes(bo_c.read(plan.M_pad * plan.N_pad * 4, 0)), dtype=np.float32)
+            c_out = c_out.reshape(plan.M_pad, plan.N_pad)[:M, :self.out_features].copy()
+        with profile("lin.to_torch"):
+            return torch.from_numpy(c_out).reshape(*orig_shape[:-1], self.out_features)
 
 
 # -------------------- self-test --------------------
