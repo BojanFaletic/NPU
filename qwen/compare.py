@@ -170,25 +170,35 @@ def chain_compare(ts: TensorStore, dump: Path,
               f"{'MATCH' if ours_top1 == ref_top1 else 'MISMATCH'}")
 
 
-def compare_moe(ts: TensorStore, dump: Path, i: int, *, npu: bool = False) -> None:
+def compare_moe(ts: TensorStore, dump: Path, i: int,
+                *, npu: tuple[str, ...] = ()) -> None:
     """Test MoE at layer i. Inputs come from the oracle so we isolate this
     block. Compares router logits, top-k, per-expert SwiGLU, and final ffn_out.
 
-    With ``npu=True`` the router F.linear is routed through NpuMatVec on
-    the XDNA 2 NPU; the rest of the block stays on CPU. This validates the
-    NPU dispatch directly against the oracle, not just transitively.
+    The ``npu`` tuple selects which dense ops to route through NpuMatVec on
+    the XDNA 2 NPU; everything else stays on CPU. This validates the NPU
+    dispatch directly against the oracle, not just transitively.
+
+    Supported entries: ``"router"``, ``"shexp"``.
     """
     cfg = ts.cfg
-    print(f"\n=== block {i:02d} MoE{'  [npu router]' if npu else ''} ===")
+    label = f"  [npu {'+'.join(npu)}]" if npu else ""
+    print(f"\n=== block {i:02d} MoE{label} ===")
 
     cur = load_oracle(dump, f"attn_post_norm-{i}").reshape(1, -1)   # [1, D]
     moe = MoELayer.load(ts, i)
     if npu:
         from npu.mv import NpuMatVec
-        moe.npu = {"router": NpuMatVec(moe.w_router)}
+        moe.npu = {}
+        if "router" in npu:
+            moe.npu["router"] = NpuMatVec(moe.w_router)
+        if "shexp" in npu:
+            moe.npu["sh_gate"] = NpuMatVec(moe.w_gate_sh)
+            moe.npu["sh_up"] = NpuMatVec(moe.w_up_sh)
+            moe.npu["sh_down"] = NpuMatVec(moe.w_down_sh)
 
     # 1) Router logits
-    if npu:
+    if "router" in npu:
         logits = moe.npu["router"](cur).squeeze(0)                  # [E]
     else:
         logits = F.linear(cur, moe.w_router).squeeze(0)             # [E]
@@ -230,10 +240,17 @@ def compare_moe(ts: TensorStore, dump: Path, i: int, *, npu: bool = False) -> No
     diff(f"ffn_moe_out-{i}", moe_out, load_oracle(dump, f"ffn_moe_out-{i}"))
 
     # 6) Shared expert
-    sh_g = F.linear(cur, moe.w_gate_sh).squeeze(0)
-    sh_u = F.linear(cur, moe.w_up_sh).squeeze(0)
+    if "shexp" in npu:
+        sh_g = moe.npu["sh_gate"](cur).reshape(-1)
+        sh_u = moe.npu["sh_up"](cur).reshape(-1)
+    else:
+        sh_g = F.linear(cur, moe.w_gate_sh).squeeze(0)
+        sh_u = F.linear(cur, moe.w_up_sh).squeeze(0)
     sh = F.silu(sh_g) * sh_u
-    sh_out = F.linear(sh, moe.w_down_sh)
+    if "shexp" in npu:
+        sh_out = moe.npu["sh_down"](sh).reshape(-1)
+    else:
+        sh_out = F.linear(sh, moe.w_down_sh)
     diff(f"ffn_shexp-{i}", sh_out, load_oracle(dump, f"ffn_shexp-{i}"))
 
     # 7) Shared gate (1-D dot product → scalar)
@@ -269,10 +286,10 @@ def main() -> int:
                          "not oracle's) and compare l_out at every step")
     ap.add_argument("--chain-n", type=int, default=40,
                     help="how many layers to chain (default: all 40)")
-    ap.add_argument("--npu", action="store_true",
-                    help="route NPU-eligible ops (currently: router) through "
-                         "XDNA 2 NpuMatVec instead of F.linear; only meaningful "
-                         "with --moe-layer.")
+    ap.add_argument("--npu", default=None,
+                    help="comma-sep ops to route through XDNA 2 NpuMatVec "
+                         "instead of F.linear (router, shexp); only "
+                         "meaningful with --moe-layer.")
     args = ap.parse_args()
 
     dump = Path(args.dump)
@@ -282,7 +299,10 @@ def main() -> int:
     cos, sin = build_partial_rope_cache(cfg.rope_dim, 512, cfg.rope_theta)
 
     if args.moe_layer is not None:
-        compare_moe(ts, dump, args.moe_layer, npu=args.npu)
+        npu_ops: tuple[str, ...] = ()
+        if args.npu:
+            npu_ops = tuple(s.strip() for s in args.npu.split(",") if s.strip())
+        compare_moe(ts, dump, args.moe_layer, npu=npu_ops)
         return 0
 
     if args.chain:

@@ -432,10 +432,22 @@ def moe_forward(x: torch.Tensor, layer: MoELayer, cfg: Config) -> torch.Tensor:
     # --- Shared expert: SwiGLU followed by a *scalar* (per-token) sigmoid gate.
     # ffn_gate_inp_shexp is shape (D,): llama.cpp's build_lora_mm treats the
     # 1-D weight as a dot product, producing one gate value per token.
-    sh_gate = F.linear(x_flat, layer.w_gate_sh)
-    sh_up = F.linear(x_flat, layer.w_up_sh)
+    npu_shexp = (
+        layer.npu is not None
+        and "sh_gate" in layer.npu
+        and x_flat.shape[0] == 1
+    )
+    if npu_shexp:
+        sh_gate = layer.npu["sh_gate"](x_flat)
+        sh_up = layer.npu["sh_up"](x_flat)
+    else:
+        sh_gate = F.linear(x_flat, layer.w_gate_sh)
+        sh_up = F.linear(x_flat, layer.w_up_sh)
     sh = F.silu(sh_gate) * sh_up
-    shared_out = F.linear(sh, layer.w_down_sh)              # [BT, D]
+    if npu_shexp:
+        shared_out = layer.npu["sh_down"](sh)               # [1, D]
+    else:
+        shared_out = F.linear(sh, layer.w_down_sh)          # [BT, D]
     shared_scalar_gate = torch.sigmoid(x_flat @ layer.w_gate_inp_sh)  # [BT]
     shared_out = shared_out * shared_scalar_gate.unsqueeze(-1)
 
@@ -522,23 +534,30 @@ def enable_npu(model: Model, ops: Sequence[str] = ("router",)) -> None:
 
     Currently supported ops:
         router    — MoE router (40 layers, [n_expert=256, D=2048])
+        shexp     — shared expert gate/up/down (40 layers; gate/up share
+                    shape [512, 2048], down is [2048, 512])
 
     Each new (out, in) shape mints one xclbin (~30 s cold, cached after).
     NpuMatVec is T=1-only; the dispatch path falls back to F.linear for T>1.
     """
     from npu.mv import NpuMatVec
 
-    valid = {"router"}
+    valid = {"router", "shexp"}
     unknown = set(ops) - valid
     if unknown:
         raise ValueError(f"unknown NPU ops: {sorted(unknown)} (valid: {sorted(valid)})")
 
-    if "router" in ops:
-        for _core, moe in model.layers:
-            if moe.npu is None:
-                moe.npu = {}
+    for _core, moe in model.layers:
+        if moe.npu is None:
+            moe.npu = {}
+        if "router" in ops:
             # All routers share shape [n_expert=256, D=2048] → one xclbin total.
             moe.npu["router"] = NpuMatVec(moe.w_router)
+        if "shexp" in ops:
+            # gate/up share (512, 2048); down is (2048, 512). Two xclbins total.
+            moe.npu["sh_gate"] = NpuMatVec(moe.w_gate_sh)
+            moe.npu["sh_up"] = NpuMatVec(moe.w_up_sh)
+            moe.npu["sh_down"] = NpuMatVec(moe.w_down_sh)
 
 
 def forward(
