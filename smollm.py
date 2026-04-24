@@ -77,7 +77,8 @@ def empty_cache(cfg: Config) -> KVCache:
 
 class Layer:
     __slots__ = ("wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down", "ln1", "ln2",
-                 "wqkv", "w_gate_up", "npu", "npu_decode_cpu", "npu_decode_attention")
+                 "wqkv", "w_gate_up", "npu", "npu_decode", "npu_decode_cpu",
+                 "npu_decode_attention")
 
     def __init__(self, sd: dict, i: int):
         p = f"model.layers.{i}."
@@ -95,15 +96,22 @@ class Layer:
         self.wqkv = torch.cat([self.wq, self.wk, self.wv], dim=0)
         self.w_gate_up = torch.cat([self.w_gate, self.w_up], dim=0)
         self.npu: dict[str, object] | None = None  # filled by SmolLM when --npu
+        self.npu_decode: dict[str, object] | None = None
         self.npu_decode_cpu = False
         self.npu_decode_attention = False
+
+    def _flat_m(self, x: torch.Tensor) -> int:
+        return x.reshape(-1, x.shape[-1]).shape[0]
+
+    def _use_npu_decode(self, name: str, x: torch.Tensor) -> bool:
+        return self.npu_decode is not None and name in self.npu_decode and self._flat_m(x) == 1
 
     def _use_npu(self, name: str, x: torch.Tensor) -> bool:
         # Optional diagnostic/fast-chat fallback: decode is a single-row matmul
         # per projection. On the current XRT path that means 120 tiny NPU
         # launches per token, each padded to M=256, which is far slower than
         # torch CPU matmul. The default stays full-NPU for projection ops.
-        M = x.reshape(-1, x.shape[-1]).shape[0]
+        M = self._flat_m(x)
         return (
             self.npu is not None
             and name in self.npu
@@ -112,6 +120,8 @@ class Layer:
 
     def _lin(self, name: str, x: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
         """F.linear(x, W) — routed through NPU if this layer has an NpuLinear."""
+        if self._use_npu_decode(name, x):
+            return self.npu_decode[name](x)
         if self._use_npu(name, x):
             return self.npu[name](x)
         return F.linear(x, W)
@@ -169,7 +179,13 @@ class Layer:
         with profile("rms1"):
             h = rms_norm(x, self.ln1, cfg.rms_eps)
         with profile("qkv"):
-            if self._use_npu("wqkv", h):
+            if self._use_npu_decode("wqkv", h):
+                qkv = self.npu_decode["wqkv"](h)
+                Nq, Nk = Hq * Dh, Hkv * Dh
+                q = qkv[..., :Nq].view(B, T, Hq,  Dh).transpose(1, 2)
+                k = qkv[..., Nq:Nq + Nk].view(B, T, Hkv, Dh).transpose(1, 2)
+                v = qkv[..., Nq + Nk:].view(B, T, Hkv, Dh).transpose(1, 2)
+            elif self._use_npu("wqkv", h):
                 qkv = self.npu["wqkv"](h)
                 Nq, Nk = Hq * Dh, Hkv * Dh
                 q = qkv[..., :Nq].view(B, T, Hq,  Dh).transpose(1, 2)
@@ -221,7 +237,11 @@ class Layer:
         with profile("rms2"):
             h = rms_norm(x, self.ln2, cfg.rms_eps)
         with profile("gate_up"):
-            if self._use_npu("w_gate_up", h):
+            if self._use_npu_decode("w_gate_up", h):
+                gu = self.npu_decode["w_gate_up"](h)
+                gate = F.silu(gu[..., :cfg.ffn_dim])
+                up = gu[..., cfg.ffn_dim:]
+            elif self._use_npu("w_gate_up", h):
                 gu = self.npu["w_gate_up"](h)
                 gate = F.silu(gu[..., :cfg.ffn_dim])
                 up = gu[..., cfg.ffn_dim:]
@@ -251,6 +271,7 @@ class SmolLM:
         attention: bool = True,
         cpu_decode_fallback: bool = False,
         decode_attention: bool = False,
+        decode_matvec: bool = False,
     ) -> None:
         """Route NPU-offloadable layers. Each flag is independent.
 
@@ -266,6 +287,8 @@ class SmolLM:
         - decode_attention: route T=1 attention through NpuAttention too. This
           is off by default because it adds per-token dispatches and may compile
           a new FA xclbin when the KV length crosses a bucket boundary.
+        - decode_matvec: route T=1 projection matmuls through the decode
+          matrix-vector prototype instead of the padded matrix-matrix path.
         - softmax: the old standalone NPU softmax path (projection-matmul +
           softmax, leaves Q·K^T and ·V on CPU). Kept available for comparison
           but a net regression end-to-end vs attention=True.
@@ -273,11 +296,18 @@ class SmolLM:
         from npu.linear import NpuLinear  # local import to keep CPU path zero-cost
         for layer in self.layers:
             layer.npu = {}
+            layer.npu_decode = {}
             layer.npu_decode_cpu = cpu_decode_fallback
             layer.npu_decode_attention = decode_attention
             for op in ops:
                 W = getattr(layer, op)
                 layer.npu[op] = NpuLinear(W)
+        if decode_matvec:
+            from npu.mv import NpuMatVec
+            for layer in self.layers:
+                for op in ops:
+                    W = getattr(layer, op)
+                    layer.npu_decode[op] = NpuMatVec(W)
         if softmax:
             from npu.softmax import NpuSoftmax
             shared_softmax = NpuSoftmax(n_cores=1)
@@ -352,6 +382,8 @@ def main():
                    help="with --npu, route single-token decode projections to CPU")
     p.add_argument("--npu-decode-attn", action="store_true",
                    help="with --npu, route single-token attention through NpuAttention")
+    p.add_argument("--npu-decode-matvec", action="store_true",
+                   help="with --npu, route single-token projections through NpuMatVec")
     args = p.parse_args()
 
     model, tok, hf = load(torch.float32)
@@ -360,6 +392,7 @@ def main():
         model.enable_npu(
             cpu_decode_fallback=args.cpu_decode_fallback,
             decode_attention=args.npu_decode_attn,
+            decode_matvec=args.npu_decode_matvec,
         )
     ids = tok(args.prompt, return_tensors="pt").input_ids
 

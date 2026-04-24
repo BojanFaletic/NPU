@@ -178,6 +178,8 @@ def main():
                     help="with NPU enabled, route single-token decode projections to CPU")
     ap.add_argument("--npu-decode-attn", action="store_true",
                     help="with NPU enabled, route single-token attention through NpuAttention")
+    ap.add_argument("--npu-decode-matvec", action="store_true",
+                    help="with NPU enabled, route single-token projections through NpuMatVec")
     args = ap.parse_args()
 
     lengths = [int(x) for x in args.lengths.split(",") if x.strip()]
@@ -196,6 +198,7 @@ def main():
         model_npu.enable_npu(
             cpu_decode_fallback=args.cpu_decode_fallback,
             decode_attention=args.npu_decode_attn,
+            decode_matvec=args.npu_decode_matvec,
         )
 
     # Pre-warm: trigger xclbin compile at every L so the reported prefill
