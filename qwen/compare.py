@@ -170,18 +170,28 @@ def chain_compare(ts: TensorStore, dump: Path,
               f"{'MATCH' if ours_top1 == ref_top1 else 'MISMATCH'}")
 
 
-def compare_moe(ts: TensorStore, dump: Path, i: int) -> None:
+def compare_moe(ts: TensorStore, dump: Path, i: int, *, npu: bool = False) -> None:
     """Test MoE at layer i. Inputs come from the oracle so we isolate this
     block. Compares router logits, top-k, per-expert SwiGLU, and final ffn_out.
+
+    With ``npu=True`` the router F.linear is routed through NpuMatVec on
+    the XDNA 2 NPU; the rest of the block stays on CPU. This validates the
+    NPU dispatch directly against the oracle, not just transitively.
     """
     cfg = ts.cfg
-    print(f"\n=== block {i:02d} MoE ===")
+    print(f"\n=== block {i:02d} MoE{'  [npu router]' if npu else ''} ===")
 
     cur = load_oracle(dump, f"attn_post_norm-{i}").reshape(1, -1)   # [1, D]
     moe = MoELayer.load(ts, i)
+    if npu:
+        from npu.mv import NpuMatVec
+        moe.npu = {"router": NpuMatVec(moe.w_router)}
 
     # 1) Router logits
-    logits = F.linear(cur, moe.w_router).squeeze(0)                # [E]
+    if npu:
+        logits = moe.npu["router"](cur).squeeze(0)                  # [E]
+    else:
+        logits = F.linear(cur, moe.w_router).squeeze(0)             # [E]
     diff(f"ffn_moe_logits-{i}", logits, load_oracle(dump, f"ffn_moe_logits-{i}"))
 
     # 2) softmax over all experts
@@ -259,6 +269,10 @@ def main() -> int:
                          "not oracle's) and compare l_out at every step")
     ap.add_argument("--chain-n", type=int, default=40,
                     help="how many layers to chain (default: all 40)")
+    ap.add_argument("--npu", action="store_true",
+                    help="route NPU-eligible ops (currently: router) through "
+                         "XDNA 2 NpuMatVec instead of F.linear; only meaningful "
+                         "with --moe-layer.")
     args = ap.parse_args()
 
     dump = Path(args.dump)
@@ -268,7 +282,7 @@ def main() -> int:
     cos, sin = build_partial_rope_cache(cfg.rope_dim, 512, cfg.rope_theta)
 
     if args.moe_layer is not None:
-        compare_moe(ts, dump, args.moe_layer)
+        compare_moe(ts, dump, args.moe_layer, npu=args.npu)
         return 0
 
     if args.chain:
