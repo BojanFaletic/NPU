@@ -161,8 +161,9 @@ def compile_xclbin(mlir: Path, obj: Path, build: Path) -> tuple[Path, Path]:
     insts  = build / "insts.bin"
     # aiecc expects the .o in the cwd so MLIR symbol "mm_MxKxN.o" resolves
     assert obj.parent == build
+    aiecc = shutil.which("aiecc") or str(MLIR_AIE / "bin" / "aiecc")
     cmd = [
-        "aiecc", "--aie-generate-xclbin", f"--xclbin-name={xclbin.name}",
+        aiecc, "--aie-generate-xclbin", f"--xclbin-name={xclbin.name}",
         "--no-xchesscc", "--no-xbridge", f"--peano={PEANO}",
         "--aie-generate-npu-insts", f"--npu-insts-name={insts.name}",
         str(mlir.resolve()),

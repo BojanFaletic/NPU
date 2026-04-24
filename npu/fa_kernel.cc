@@ -84,6 +84,13 @@ void attn_block(bfloat16 *restrict Q_with_header, bfloat16 *restrict KV) {
   bfloat16 *V = KV + BC * DH;
   const int start_col = g_block_idx * BC;
 
+  // In causal prefill, whole KV blocks can sit strictly beyond every row in
+  // this Q block. They would be masked to -inf, so skip all QK/softmax/PV math.
+  if (g_causal && start_col > g_start_row + BR - 1) {
+    g_block_idx++;
+    return;
+  }
+
   // S = Q · K^T · inv_sqrt_d. The host pre-tiles Q into [BR/r][D/s][r][s] and
   // K into [D/s][BC/t][s][t] with r=4, s=8, t=8 so each tile is a contiguous
   // 64-byte (32 bf16) vector. aie::mmul<r,s,t> produces a 4×8 fp32 output
