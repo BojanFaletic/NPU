@@ -88,6 +88,13 @@ def compare_layer(ts: TensorStore, dump: Path, i: int,
                 layer.npu["wv"] = NpuMatVec(layer.wv)
     else:
         layer = SSMLayer.load(ts, i)
+        if "ssm" in npu:
+            from npu.mv import NpuMatVec
+            layer.npu = {
+                "w_in": NpuMatVec(layer.w_in),
+                "w_gate": NpuMatVec(layer.w_gate),
+                "w_out": NpuMatVec(layer.w_out),
+            }
 
     # attn_norm
     h = rms_norm(x, layer.attn_norm, cfg.rms_eps)
@@ -300,8 +307,8 @@ def main() -> int:
     ap.add_argument("--npu", default=None,
                     help="comma-sep ops to route through XDNA 2 NpuMatVec "
                          "instead of F.linear (router, shexp, attn_o, "
-                         "attn_qkv). router/shexp are MoE-side "
-                         "(--moe-layer); attn_o/attn_qkv are mixer-side "
+                         "attn_qkv, ssm). router/shexp are MoE-side "
+                         "(--moe-layer); attn_o/attn_qkv/ssm are mixer-side "
                          "(--layers / default).")
     args = ap.parse_args()
 

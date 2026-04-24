@@ -233,6 +233,9 @@ class SSMLayer:
     dt_bias: torch.Tensor                # ssm_dt.bias: [n_v_heads]
     ssm_norm: torch.Tensor               # [head_v_dim=128]
     w_out: torch.Tensor                  # ssm_out: [D, d_inner=4096]
+    # NPU dispatch handles (populated by enable_npu()) for w_in / w_gate /
+    # w_out at T=1. alpha/beta are 32-row — too small to be worth dispatching.
+    npu: dict | None = None
 
     @classmethod
     def load(cls, ts: TensorStore, i: int) -> "SSMLayer":
@@ -294,8 +297,17 @@ def ssm_forward(
     h = rms_norm(x, layer.attn_norm, cfg.rms_eps)
 
     # --- Input projections ---------------------------------------------------
-    qkv_mixed = F.linear(h, layer.w_in)          # [B, T, 8192]
-    z = F.linear(h, layer.w_gate)                # [B, T, 4096]
+    npu_ssm = (
+        layer.npu is not None
+        and "w_in" in layer.npu
+        and B == 1 and T == 1
+    )
+    if npu_ssm:
+        qkv_mixed = layer.npu["w_in"](h.reshape(-1)).reshape(1, 1, conv_ch)
+        z = layer.npu["w_gate"](h.reshape(-1)).reshape(1, 1, d_inner)
+    else:
+        qkv_mixed = F.linear(h, layer.w_in)          # [B, T, 8192]
+        z = F.linear(h, layer.w_gate)                # [B, T, 4096]
 
     # --- α, β per head per token --------------------------------------------
     # alpha_proj → (B, T, Hv); add dt_bias; softplus; multiply by a_coef.
@@ -380,7 +392,10 @@ def ssm_forward(
     o = o * F.silu(z)                                        # [B, T, 4096]
 
     # --- Output projection ---------------------------------------------------
-    out = F.linear(o, layer.w_out)                           # [B, T, D]
+    if npu_ssm:
+        out = layer.npu["w_out"](o.reshape(-1)).reshape(1, 1, D)
+    else:
+        out = F.linear(o, layer.w_out)                       # [B, T, D]
 
     return out, (new_conv_state, S)
 
@@ -562,13 +577,16 @@ def enable_npu(model: Model, ops: Sequence[str] = ("router",)) -> None:
         attn_o    — attention output proj (10 attn layers, [2048, 4096])
         attn_qkv  — attention Q/K/V projections (10 attn layers; Q is
                     [8192, 2048], K/V share [512, 2048] with shexp gate)
+        ssm       — Gated DeltaNet in/gate/out (30 SSM layers; w_in shares
+                    [8192, 2048] with attn wq, w_out shares [2048, 4096]
+                    with attn_o, w_gate [4096, 2048] is new)
 
     Each new (out, in) shape mints one xclbin (~30 s cold, cached after).
     NpuMatVec is T=1-only; the dispatch path falls back to F.linear for T>1.
     """
     from npu.mv import NpuMatVec
 
-    valid = {"router", "shexp", "attn_o", "attn_qkv"}
+    valid = {"router", "shexp", "attn_o", "attn_qkv", "ssm"}
     unknown = set(ops) - valid
     if unknown:
         raise ValueError(f"unknown NPU ops: {sorted(unknown)} (valid: {sorted(valid)})")
@@ -596,6 +614,12 @@ def enable_npu(model: Model, ops: Sequence[str] = ("router",)) -> None:
             core.npu["wq"] = NpuMatVec(core.wq)
             core.npu["wk"] = NpuMatVec(core.wk)
             core.npu["wv"] = NpuMatVec(core.wv)
+        if "ssm" in ops and isinstance(core, SSMLayer):
+            if core.npu is None:
+                core.npu = {}
+            core.npu["w_in"] = NpuMatVec(core.w_in)
+            core.npu["w_gate"] = NpuMatVec(core.w_gate)
+            core.npu["w_out"] = NpuMatVec(core.w_out)
 
 
 def forward(
