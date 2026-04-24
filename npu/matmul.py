@@ -168,8 +168,23 @@ def compile_xclbin(mlir: Path, obj: Path, build: Path) -> tuple[Path, Path]:
         "--aie-generate-npu-insts", f"--npu-insts-name={insts.name}",
         str(mlir.resolve()),
     ]
+    # aiecc shells out to xclbinutil (XRT) at the very last step. When
+    # not invoked from a shell that sourced /opt/xilinx/xrt/setup.sh,
+    # xclbinutil isn't on PATH and aiecc *silently* skips packaging the
+    # .xclbin (only prints "Warning: xclbinutil not found, skipping
+    # xclbin generation"), then exits 0. Force the XRT bin dir onto PATH
+    # so the build is reproducible regardless of caller shell state.
+    env = os.environ.copy()
+    xrt_bin = "/opt/xilinx/xrt/bin"
+    if xrt_bin not in env.get("PATH", "").split(os.pathsep):
+        env["PATH"] = xrt_bin + os.pathsep + env.get("PATH", "")
     print("[aiecc]", " ".join(cmd))
-    subprocess.run(cmd, check=True, cwd=build)
+    subprocess.run(cmd, check=True, cwd=build, env=env)
+    if not xclbin.exists():
+        raise RuntimeError(
+            f"aiecc returned 0 but did not produce {xclbin}. "
+            f"Most often: xclbinutil not on PATH (need /opt/xilinx/xrt/bin)."
+        )
     return xclbin, insts
 
 
