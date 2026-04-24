@@ -100,6 +100,10 @@ class AttnLayer:
     wo: torch.Tensor                    # [D, n_head*head_dim]
     q_norm: torch.Tensor                # [head_dim]
     k_norm: torch.Tensor                # [head_dim]
+    # NPU dispatch handles for the wq / wk / wv / wo F.linear sites,
+    # populated by enable_npu(). Each entry is callable equivalent to
+    # F.linear(x, W). T=1 path uses NpuMatVec; T>1 falls back to F.linear.
+    npu: dict | None = None
 
     @classmethod
     def load(cls, ts: TensorStore, i: int) -> "AttnLayer":
@@ -187,7 +191,14 @@ def attn_forward(
     # (qwen35moe.cpp: gate_sigmoid = ggml_sigmoid(gate); cur = cur * gate_sigmoid)
     out = out * torch.sigmoid(q_gate)             # [B, T, Hq, Dh]
     out = out.view(B, T, Hq * Dh)
-    out = F.linear(out, layer.wo)
+    if (
+        layer.npu is not None
+        and "wo" in layer.npu
+        and B == 1 and T == 1
+    ):
+        out = layer.npu["wo"](out.reshape(-1)).reshape(1, 1, D)
+    else:
+        out = F.linear(out, layer.wo)
 
     return out, new_cache
 
@@ -536,18 +547,19 @@ def enable_npu(model: Model, ops: Sequence[str] = ("router",)) -> None:
         router    — MoE router (40 layers, [n_expert=256, D=2048])
         shexp     — shared expert gate/up/down (40 layers; gate/up share
                     shape [512, 2048], down is [2048, 512])
+        attn_o    — attention output proj (10 attn layers, [2048, 4096])
 
     Each new (out, in) shape mints one xclbin (~30 s cold, cached after).
     NpuMatVec is T=1-only; the dispatch path falls back to F.linear for T>1.
     """
     from npu.mv import NpuMatVec
 
-    valid = {"router", "shexp"}
+    valid = {"router", "shexp", "attn_o"}
     unknown = set(ops) - valid
     if unknown:
         raise ValueError(f"unknown NPU ops: {sorted(unknown)} (valid: {sorted(valid)})")
 
-    for _core, moe in model.layers:
+    for core, moe in model.layers:
         if moe.npu is None:
             moe.npu = {}
         if "router" in ops:
@@ -558,6 +570,11 @@ def enable_npu(model: Model, ops: Sequence[str] = ("router",)) -> None:
             moe.npu["sh_gate"] = NpuMatVec(moe.w_gate_sh)
             moe.npu["sh_up"] = NpuMatVec(moe.w_up_sh)
             moe.npu["sh_down"] = NpuMatVec(moe.w_down_sh)
+        if "attn_o" in ops and isinstance(core, AttnLayer):
+            # All 10 attention layers share shape (2048, 4096) → one xclbin.
+            if core.npu is None:
+                core.npu = {}
+            core.npu["wo"] = NpuMatVec(core.wo)
 
 
 def forward(

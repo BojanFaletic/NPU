@@ -60,11 +60,13 @@ def diff(name: str, ours: torch.Tensor, ref: torch.Tensor,
 
 
 def compare_layer(ts: TensorStore, dump: Path, i: int,
-                  cos_table: torch.Tensor, sin_table: torch.Tensor) -> None:
+                  cos_table: torch.Tensor, sin_table: torch.Tensor,
+                  *, npu: tuple[str, ...] = ()) -> None:
     cfg = ts.cfg
     is_attn = cfg.is_attention[i]
     kind = "attn" if is_attn else "ssm "
-    print(f"\n=== block {i:02d} ({kind}) ===")
+    label = f"  [npu {'+'.join(npu)}]" if npu else ""
+    print(f"\n=== block {i:02d} ({kind}){label} ===")
 
     # Input is oracle's previous l_out (or input_embed for i=0).
     if i == 0:
@@ -75,6 +77,9 @@ def compare_layer(ts: TensorStore, dump: Path, i: int,
 
     if is_attn:
         layer = AttnLayer.load(ts, i)
+        if "attn_o" in npu:
+            from npu.mv import NpuMatVec
+            layer.npu = {"wo": NpuMatVec(layer.wo)}
     else:
         layer = SSMLayer.load(ts, i)
 
@@ -288,8 +293,9 @@ def main() -> int:
                     help="how many layers to chain (default: all 40)")
     ap.add_argument("--npu", default=None,
                     help="comma-sep ops to route through XDNA 2 NpuMatVec "
-                         "instead of F.linear (router, shexp); only "
-                         "meaningful with --moe-layer.")
+                         "instead of F.linear (router, shexp, attn_o). "
+                         "router/shexp are MoE-side (--moe-layer); attn_o "
+                         "is mixer-side (--layers / default).")
     args = ap.parse_args()
 
     dump = Path(args.dump)
@@ -298,10 +304,11 @@ def main() -> int:
 
     cos, sin = build_partial_rope_cache(cfg.rope_dim, 512, cfg.rope_theta)
 
+    npu_ops: tuple[str, ...] = ()
+    if args.npu:
+        npu_ops = tuple(s.strip() for s in args.npu.split(",") if s.strip())
+
     if args.moe_layer is not None:
-        npu_ops: tuple[str, ...] = ()
-        if args.npu:
-            npu_ops = tuple(s.strip() for s in args.npu.split(",") if s.strip())
         compare_moe(ts, dump, args.moe_layer, npu=npu_ops)
         return 0
 
@@ -315,7 +322,7 @@ def main() -> int:
         layers = [int(x) for x in args.layers.split(",")]
 
     for i in layers:
-        compare_layer(ts, dump, i, cos, sin)
+        compare_layer(ts, dump, i, cos, sin, npu=npu_ops)
 
     return 0
 
