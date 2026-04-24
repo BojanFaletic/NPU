@@ -381,6 +381,10 @@ class MoELayer:
     w_up_sh: torch.Tensor | None = None
     w_down_sh: torch.Tensor | None = None          # [D, ff_sh]
     w_gate_inp_sh: torch.Tensor | None = None      # [D]
+    # NPU dispatch handles, populated by enable_npu(). Each entry is a callable
+    # equivalent to F.linear(x, W). T=1 path uses NpuMatVec; T>1 falls back to
+    # F.linear since NpuMatVec is single-vector only.
+    npu: dict | None = None
 
     @classmethod
     def load(cls, ts: TensorStore, i: int, dtype=torch.float32) -> "MoELayer":
@@ -437,7 +441,10 @@ def moe_forward(x: torch.Tensor, layer: MoELayer, cfg: Config) -> torch.Tensor:
 
     # --- Routed experts. Match llama.cpp's qwen35moe ordering: softmax over
     # all E experts first, then top-K, then renormalize the top-K weights.
-    router_logits = F.linear(x_flat, layer.w_router)              # [BT, E]
+    if layer.npu is not None and "router" in layer.npu and x_flat.shape[0] == 1:
+        router_logits = layer.npu["router"](x_flat)               # [1, E]
+    else:
+        router_logits = F.linear(x_flat, layer.w_router)          # [BT, E]
     probs = F.softmax(router_logits.float(), dim=-1).to(x.dtype)  # [BT, E]
     topk_vals, topk_ids = probs.topk(K, dim=-1)                   # [BT, K]
     topk_w = topk_vals / topk_vals.sum(-1, keepdim=True).clamp_min(1e-20)
@@ -508,6 +515,30 @@ class Model:
 
         return cls(cfg=cfg, token_embd=emb, output_norm=onorm, lm_head=lmh,
                    layers=layers, rope_cos=cos, rope_sin=sin)
+
+
+def enable_npu(model: Model, ops: Sequence[str] = ("router",)) -> None:
+    """Wrap selected dense F.linear sites in NpuMatVec on the XDNA 2 NPU.
+
+    Currently supported ops:
+        router    — MoE router (40 layers, [n_expert=256, D=2048])
+
+    Each new (out, in) shape mints one xclbin (~30 s cold, cached after).
+    NpuMatVec is T=1-only; the dispatch path falls back to F.linear for T>1.
+    """
+    from npu.mv import NpuMatVec
+
+    valid = {"router"}
+    unknown = set(ops) - valid
+    if unknown:
+        raise ValueError(f"unknown NPU ops: {sorted(unknown)} (valid: {sorted(valid)})")
+
+    if "router" in ops:
+        for _core, moe in model.layers:
+            if moe.npu is None:
+                moe.npu = {}
+            # All routers share shape [n_expert=256, D=2048] → one xclbin total.
+            moe.npu["router"] = NpuMatVec(moe.w_router)
 
 
 def forward(

@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from qwen.model import TensorStore
-from qwen.forward import Model, forward
+from qwen.forward import Model, enable_npu, forward
 
 
 def main() -> int:
@@ -38,6 +38,10 @@ def main() -> int:
                     help="debug: print per-layer hidden norm")
     ap.add_argument("--n-prompt", type=int, default=None,
                     help="debug: slice prompt to the first N tokens")
+    ap.add_argument("--npu", default=None,
+                    help="comma-sep ops to dispatch on the XDNA 2 NPU "
+                         "(currently: 'router'). Each op is T=1 only; T>1 "
+                         "transparently falls back to F.linear.")
     args = ap.parse_args()
 
     cache = Path(args.cache)
@@ -59,6 +63,12 @@ def main() -> int:
     model = Model.load(ts, max_pos=args.max_pos)
     print(f"model load:   {time.time()-t0:.1f}s   "
           f"(MoE experts are lazy; dequanted per forward)")
+
+    if args.npu:
+        ops = tuple(s.strip() for s in args.npu.split(",") if s.strip())
+        t0 = time.time()
+        enable_npu(model, ops=ops)
+        print(f"NPU enabled:  ops={ops}  ({time.time()-t0:.1f}s)")
 
     # --- Prefill ---
     print(f"\nprefill T={len(prompt_tokens)}  "
