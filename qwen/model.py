@@ -179,7 +179,20 @@ class TensorStore:
 
     def get(self, name: str, dtype: str = "fp32",
             keep: bool = True) -> np.ndarray:
-        """Return dequantized tensor in GGML shape order (in, out)."""
+        """Return the dequantized tensor with numpy shape = reversed(t.shape).
+
+        gguf-py stores raw bytes in ggml order (ne[0] is fastest). The flat
+        element decode preserves that order. A numpy `.reshape(t.shape)`
+        iterates in C-order (last dim fastest), which is the *opposite*
+        convention and produces a scrambled layout. Reshaping to
+        `reversed(t.shape)` re-aligns the axes: the numpy array then
+        satisfies `arr[a, b, ...] == ggml_tensor[..., b, a]`.
+
+        For Linear weights this means the return value is already in torch's
+        (out, in) convention — no transpose needed. For stacked expert
+        tensors (D, ff, n_expert) it comes out (n_expert, ff, D), with
+        expert index outermost.
+        """
         if dtype not in ("fp32", "fp16", "bf16"):
             raise ValueError(dtype)
         key = (name, dtype)
@@ -191,13 +204,13 @@ class TensorStore:
         if t is None:
             raise KeyError(name)
 
+        np_shape = tuple(reversed([int(x) for x in t.shape]))
+
         if t.tensor_type == GGMLQuantizationType.F32:
-            arr = np.asarray(t.data).view(np.float32).reshape(
-                tuple(int(x) for x in t.shape))
+            arr = np.asarray(t.data).view(np.float32).reshape(np_shape)
         else:
             arr = dequantize(t.data, t.tensor_type)
-            arr = arr.reshape(tuple(int(x) for x in t.shape))
-            arr = arr.astype(np.float32, copy=False)
+            arr = arr.reshape(np_shape).astype(np.float32, copy=False)
 
         if dtype == "fp16":
             arr = arr.astype(np.float16)

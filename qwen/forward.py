@@ -16,7 +16,7 @@ Architecture (per inspect_gguf.py + gguf's qwen35moe tensor map):
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 import numpy as np
@@ -31,16 +31,15 @@ from qwen.model import Config, TensorStore, from_bf16
 # (in, out) order; torch's F.linear expects (out, in). We transpose on load.
 # ---------------------------------------------------------------------------
 
-def _w(ts: TensorStore, name: str, dtype=torch.float32) -> torch.Tensor:
-    arr_fp32 = ts.get(name, dtype="fp32", keep=False)
-    # ggml (in, out) → torch (out, in); contiguous copy so torch owns writable mem.
-    t = torch.from_numpy(np.ascontiguousarray(arr_fp32.T).copy())
-    return t.to(dtype)
-
-
-def _v(ts: TensorStore, name: str, dtype=torch.float32) -> torch.Tensor:
+def _t(ts: TensorStore, name: str, dtype=torch.float32) -> torch.Tensor:
+    """Load a tensor as a torch Tensor in reversed(ggml shape) layout — which
+    for standard Linear weights means (out, in) directly, no transpose."""
     arr_fp32 = ts.get(name, dtype="fp32", keep=False)
     return torch.from_numpy(arr_fp32.copy()).to(dtype)
+
+
+_w = _t  # weights: same as _t — the reshape in TensorStore already gives (out, in).
+_v = _t  # 1-D vectors / norms: same load path.
 
 
 # ---------------------------------------------------------------------------
@@ -215,17 +214,15 @@ class SSMLayer:
     @classmethod
     def load(cls, ts: TensorStore, i: int) -> "SSMLayer":
         p = f"blk.{i}."
-        # ssm_conv1d is (4, 8192) in GGML order → transpose to (8192, 4) so
-        # the kernel dim is last, matching torch F.conv1d's grouped layout.
-        conv_raw = _v(ts, p + "ssm_conv1d.weight")  # (4, 8192)
-        conv = conv_raw.T.contiguous()              # (8192, 4)
+        # With the reversed-reshape convention, ssm_conv1d comes out (8192, 4)
+        # directly — (channel, kernel) which F.conv1d's depthwise layout wants.
         return cls(
             i=i,
             attn_norm=_v(ts, p + "attn_norm.weight"),
             post_norm=_v(ts, p + "post_attention_norm.weight"),
             w_in=_w(ts, p + "attn_qkv.weight"),
             w_gate=_w(ts, p + "attn_gate.weight"),
-            conv1d=conv,
+            conv1d=_v(ts, p + "ssm_conv1d.weight"),
             a=_v(ts, p + "ssm_a"),
             alpha=_w(ts, p + "ssm_alpha.weight"),
             beta=_w(ts, p + "ssm_beta.weight"),
@@ -269,14 +266,18 @@ def ssm_forward(
     conv_k = cfg.ssm_d_conv      # 4
     rep = Hv // Hk               # 2 — K heads broadcast to V heads
 
+    # attn_norm applies to SSM input too (same as for attention layers — in
+    # qwen35moe.cpp it's applied *outside* the mixer call for both branches).
+    h = rms_norm(x, layer.attn_norm, cfg.rms_eps)
+
     # --- Input projections ---------------------------------------------------
-    qkv_mixed = F.linear(x, layer.w_in)          # [B, T, 8192]
-    z = F.linear(x, layer.w_gate)                # [B, T, 4096]
+    qkv_mixed = F.linear(h, layer.w_in)          # [B, T, 8192]
+    z = F.linear(h, layer.w_gate)                # [B, T, 4096]
 
     # --- α, β per head per token --------------------------------------------
     # alpha_proj → (B, T, Hv); add dt_bias; softplus; multiply by a_coef.
-    alpha_raw = F.linear(x, layer.alpha)          # [B, T, Hv]
-    beta_raw = F.linear(x, layer.beta)            # [B, T, Hv]
+    alpha_raw = F.linear(h, layer.alpha)          # [B, T, Hv]
+    beta_raw = F.linear(h, layer.beta)            # [B, T, Hv]
     alpha_biased = alpha_raw + layer.dt_bias
     alpha_sp = F.softplus(alpha_biased)
     g = alpha_sp * layer.a                        # [B, T, Hv]   — the "log decay"
@@ -313,9 +314,12 @@ def ssm_forward(
     q = _l2_norm(q, cfg.rms_eps)
     k = _l2_norm(k, cfg.rms_eps)
 
-    # Broadcast K heads to V heads (Hk -> Hv, repeat factor `rep`).
-    q = q.repeat_interleave(rep, dim=2)                     # [B, T, Hv, Sk]
-    k = k.repeat_interleave(rep, dim=2)                     # [B, T, Hv, Sk]
+    # Broadcast K heads to V heads (Hk -> Hv, repeat factor `rep`). llama.cpp
+    # uses ggml_repeat_4d here, which produces a *tile* pattern
+    # [h0, h1, ..., h15, h0, h1, ..., h15] — so V head i pairs with K head
+    # (i mod Hk). Use torch .repeat (tile), not .repeat_interleave (block).
+    q = q.repeat(1, 1, rep, 1)                              # [B, T, Hv, Sk]
+    k = k.repeat(1, 1, rep, 1)
 
     # --- DeltaNet recurrence (autoregressive loop) ---------------------------
     # scale q by 1/sqrt(Sk) up-front (build_delta_net scales q).
@@ -364,98 +368,92 @@ def ssm_forward(
 
 @dataclass
 class MoELayer:
+    """Lazy MoE layer. Small weights (router + shared expert) are resident;
+    the 256 × 3 expert matrices are re-dequantized from the mmap'd GGUF on
+    every moe_forward call. That's ~7–8 s per call on IQ3_XXS/IQ4_XS but
+    avoids a 120 GB RAM eager load."""
     i: int
-    # Router
-    w_router: torch.Tensor               # [n_expert, D]
-    # Shared expert (always active, 1 SwiGLU)
-    w_gate_sh: torch.Tensor              # [ff, D]
-    w_up_sh: torch.Tensor                # [ff, D]
-    w_down_sh: torch.Tensor              # [D, ff]
-    w_gate_inp_sh: torch.Tensor          # [D] — scalar gate on shared expert
-    # Per-expert stacked weights, kept in fp32 (large — TODO: lazy per-expert)
-    w_gate_exps: torch.Tensor            # [n_expert, ff, D]
-    w_up_exps: torch.Tensor              # [n_expert, ff, D]
-    w_down_exps: torch.Tensor            # [n_expert, D, ff]
+    ts: TensorStore = field(repr=False)
+    dtype: torch.dtype = torch.float32
+    # Router + shared expert (kept resident — small, ~20 MB per layer).
+    w_router: torch.Tensor | None = None          # [n_expert, D]
+    w_gate_sh: torch.Tensor | None = None          # [ff_sh, D]
+    w_up_sh: torch.Tensor | None = None
+    w_down_sh: torch.Tensor | None = None          # [D, ff_sh]
+    w_gate_inp_sh: torch.Tensor | None = None      # [D]
 
     @classmethod
     def load(cls, ts: TensorStore, i: int, dtype=torch.float32) -> "MoELayer":
-        """Loads the whole MoE block. Warning: expert tensors are large
-        (~500 MB each in fp32); lazy per-expert loading is a later-session
-        optimization."""
         p = f"blk.{i}."
-
-        # Expert tensors: ggml shape for gate/up_exps is (D, ff, n_expert);
-        # for down_exps is (ff, D, n_expert). Transpose to (n_expert, out, in).
-        g = _v(ts, p + "ffn_gate_exps.weight", dtype=dtype)  # [D, ff, n_expert]
-        u = _v(ts, p + "ffn_up_exps.weight", dtype=dtype)
-        d = _v(ts, p + "ffn_down_exps.weight", dtype=dtype)  # [ff, D, n_expert]
-        # -> [n_expert, ff, D] for gate/up (out=ff, in=D)
-        g = g.permute(2, 1, 0).contiguous()
-        u = u.permute(2, 1, 0).contiguous()
-        # -> [n_expert, D, ff] for down (out=D, in=ff)
-        d = d.permute(2, 1, 0).contiguous()
-
         return cls(
-            i=i,
+            i=i, ts=ts, dtype=dtype,
             w_router=_w(ts, p + "ffn_gate_inp.weight", dtype=dtype),
             w_gate_sh=_w(ts, p + "ffn_gate_shexp.weight", dtype=dtype),
             w_up_sh=_w(ts, p + "ffn_up_shexp.weight", dtype=dtype),
             w_down_sh=_w(ts, p + "ffn_down_shexp.weight", dtype=dtype),
             w_gate_inp_sh=_v(ts, p + "ffn_gate_inp_shexp.weight", dtype=dtype),
-            w_gate_exps=g,
-            w_up_exps=u,
-            w_down_exps=d,
         )
+
+    def dequant_experts(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Dequantize the 3 expert-stack tensors for this layer. With the
+        reversed-reshape convention in TensorStore.get, shapes are already
+        (n_expert, out, in): (256, 512, 2048) for gate/up, (256, 2048, 512)
+        for down. Caller should drop references before the next call."""
+        p = f"blk.{self.i}."
+        g = _w(self.ts, p + "ffn_gate_exps.weight", dtype=self.dtype)
+        u = _w(self.ts, p + "ffn_up_exps.weight", dtype=self.dtype)
+        d = _w(self.ts, p + "ffn_down_exps.weight", dtype=self.dtype)
+        return g, u, d
 
 
 def moe_forward(x: torch.Tensor, layer: MoELayer, cfg: Config) -> torch.Tensor:
-    """x: [B, T, D]. Output [B, T, D].
-
-    Router picks top-k experts per token, softmax-normalizes their weights,
-    runs each chosen expert as SwiGLU on the selected tokens, scatters the
-    weighted results back. Plus an always-on shared expert.
-    """
+    """x: [B, T, D]. Output [B, T, D]. Dequants the 3 expert tensors for this
+    layer once per call (slow: ~7 s), drops them on return."""
     B, T, D = x.shape
     E = cfg.n_expert
     K = cfg.n_expert_used
     x_flat = x.reshape(B * T, D)
 
-    # --- Shared expert: SwiGLU with a scalar sigmoid gate per hidden dim.
-    shgate = torch.sigmoid(x_flat * layer.w_gate_inp_sh)  # [BT, D]
-    sh_in = x_flat * shgate
-    sh_gate = F.linear(sh_in, layer.w_gate_sh)
-    sh_up = F.linear(sh_in, layer.w_up_sh)
+    # --- Shared expert: SwiGLU followed by a *scalar* (per-token) sigmoid gate.
+    # ffn_gate_inp_shexp is shape (D,): llama.cpp's build_lora_mm treats the
+    # 1-D weight as a dot product, producing one gate value per token.
+    sh_gate = F.linear(x_flat, layer.w_gate_sh)
+    sh_up = F.linear(x_flat, layer.w_up_sh)
     sh = F.silu(sh_gate) * sh_up
-    shared_out = F.linear(sh, layer.w_down_sh)             # [BT, D]
+    shared_out = F.linear(sh, layer.w_down_sh)              # [BT, D]
+    shared_scalar_gate = torch.sigmoid(x_flat @ layer.w_gate_inp_sh)  # [BT]
+    shared_out = shared_out * shared_scalar_gate.unsqueeze(-1)
 
     # --- Routed experts.
-    router_logits = F.linear(x_flat, layer.w_router)       # [BT, E]
-    topk_vals, topk_ids = router_logits.topk(K, dim=-1)    # [BT, K]
-    # Softmax over the selected top-k (the standard Qwen3/Mixtral choice).
-    topk_w = F.softmax(topk_vals.float(), dim=-1).to(x.dtype)  # [BT, K]
+    router_logits = F.linear(x_flat, layer.w_router)        # [BT, E]
+    topk_vals, topk_ids = router_logits.topk(K, dim=-1)     # [BT, K]
+    topk_w = F.softmax(topk_vals.float(), dim=-1).to(x.dtype)
+
+    # Dequant expert weights for this layer only.
+    w_gate_exps, w_up_exps, w_down_exps = layer.dequant_experts()
 
     out_routed = torch.zeros_like(x_flat)
-    for e in range(E):
-        # Tokens that picked expert `e` in any of their K slots.
+    # Only iterate experts that at least one token picked.
+    picked = torch.unique(topk_ids)
+    for e in picked.tolist():
         mask = (topk_ids == e)
-        if not mask.any():
-            continue
-        # Positions [n, k] where expert e was chosen.
-        idx = mask.nonzero(as_tuple=False)     # [n_sel, 2]
+        idx = mask.nonzero(as_tuple=False)
         tok_idx = idx[:, 0]
         slot_idx = idx[:, 1]
-        xe = x_flat[tok_idx]                    # [n_sel, D]
-        we = topk_w[tok_idx, slot_idx]          # [n_sel]
+        xe = x_flat[tok_idx]
+        we = topk_w[tok_idx, slot_idx]
 
-        g = F.linear(xe, layer.w_gate_exps[e])  # [n_sel, ff]
-        u = F.linear(xe, layer.w_up_exps[e])
+        g = F.linear(xe, w_gate_exps[e])
+        u = F.linear(xe, w_up_exps[e])
         y = F.silu(g) * u
-        y = F.linear(y, layer.w_down_exps[e])   # [n_sel, D]
+        y = F.linear(y, w_down_exps[e])
 
         out_routed.index_add_(0, tok_idx, y * we.unsqueeze(-1))
 
-    out = out_routed + shared_out
-    return out.view(B, T, D)
+    # Drop the big tensors so they're GC'd before the next layer.
+    del w_gate_exps, w_up_exps, w_down_exps
+
+    return (out_routed + shared_out).view(B, T, D)
 
 
 # ---------------------------------------------------------------------------
@@ -475,10 +473,6 @@ class Model:
     @classmethod
     def load(cls, ts: TensorStore, *, max_pos: int | None = None,
              dtype=torch.float32) -> "Model":
-        # NOTE: eager-loads every block's MoE (256 experts × 3 mats × 40 layers
-        # = ~120 GB in fp32). Will OOM on 27 GiB RAM. Next session's job:
-        # swap MoELayer.load for a lazy-per-expert loader that dequants only
-        # the 8 active experts per token from the mmap'd GGUF bytes.
         cfg = ts.cfg
         mp = max_pos or cfg.n_ctx_train
 
@@ -511,22 +505,33 @@ def forward(
     start_pos: int = 0,
     kv_caches: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
     ssm_states: list[torch.Tensor | None] | None = None,
+    n_layer: int | None = None,
+    skip_moe: bool = False,
+    trace: bool = False,
 ) -> tuple[torch.Tensor, list, list]:
     """Prefill/decode forward for a single sequence.
 
-    Returns (logits [T, vocab], kv_caches list, ssm_states list).
+    Debug knobs: `n_layer` runs only the first N layers (for fast iteration),
+    `skip_moe` replaces the MoE with zeros (skips the 7 s/layer dequant),
+    `trace` prints per-layer hidden-state norm so we can see where a run
+    diverges from sanity (NaN/inf blowup).
     """
     cfg = model.cfg
-    n_layer = cfg.n_layer
+    total_layers = n_layer if n_layer is not None else cfg.n_layer
     if kv_caches is None:
-        kv_caches = [None] * n_layer
+        kv_caches = [None] * cfg.n_layer
     if ssm_states is None:
-        ssm_states = [None] * n_layer
+        ssm_states = [None] * cfg.n_layer
 
     tok = torch.tensor(tokens, dtype=torch.long).unsqueeze(0)  # [1, T]
     x = F.embedding(tok, model.token_embd)                     # [1, T, D]
+    if trace:
+        print(f"    emb: norm={x.float().norm().item():.3e}  "
+              f"max={x.float().abs().max().item():.3e}")
 
-    for i, (core, moe) in enumerate(model.layers):
+    for i in range(total_layers):
+        core, moe = model.layers[i]
+        kind = "attn" if cfg.is_attention[i] else "ssm "
         if cfg.is_attention[i]:
             y, kv_caches[i] = attn_forward(
                 x, core, cfg, model.rope_cos, model.rope_sin,
@@ -534,9 +539,16 @@ def forward(
             )
         else:
             y, ssm_states[i] = ssm_forward(x, core, cfg, ssm_states[i])
-        x = x + y                                              # residual
-        x = x + moe_forward(rms_norm(x, core.post_norm, cfg.rms_eps),
-                            moe, cfg)                          # post-norm + MoE
+        x = x + y
+        if skip_moe:
+            moe_out = torch.zeros_like(x)
+        else:
+            moe_out = moe_forward(rms_norm(x, core.post_norm, cfg.rms_eps),
+                                  moe, cfg)
+        x = x + moe_out
+        if trace:
+            print(f"    l{i:02d} {kind}: norm={x.float().norm().item():.3e}  "
+                  f"max={x.float().abs().max().item():.3e}")
 
     x = rms_norm(x, model.output_norm, cfg.rms_eps)
     logits = F.linear(x, model.lm_head)                        # [1, T, vocab]
