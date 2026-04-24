@@ -174,6 +174,10 @@ def main():
                     help="print per-op timing breakdown after the sweep")
     ap.add_argument("--max-L",    type=int, default=None,
                     help="cap max length (default: cfg.max_pos)")
+    ap.add_argument("--cpu-decode-fallback", action="store_true",
+                    help="with NPU enabled, route single-token decode projections to CPU")
+    ap.add_argument("--npu-decode-attn", action="store_true",
+                    help="with NPU enabled, route single-token attention through NpuAttention")
     args = ap.parse_args()
 
     lengths = [int(x) for x in args.lengths.split(",") if x.strip()]
@@ -189,7 +193,10 @@ def main():
     else:
         print("loading NPU model (first forward at each new L will compile xclbins)…")
         model_npu, _, _ = load(torch.float32)
-        model_npu.enable_npu()
+        model_npu.enable_npu(
+            cpu_decode_fallback=args.cpu_decode_fallback,
+            decode_attention=args.npu_decode_attn,
+        )
 
     # Pre-warm: trigger xclbin compile at every L so the reported prefill
     # time excludes cold-compile cost. Prints a per-L compile time.

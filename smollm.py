@@ -14,6 +14,11 @@ from npu.profiler import profile
 
 MODEL_ID = "HuggingFaceTB/SmolLM2-135M"
 
+# Log-spaced KV-length buckets for NPU FlashAttention. Each bucket is a
+# multiple of BC=32, so n_kv = Tk_pad / BC stays integral while decode avoids
+# minting a new xclbin at every 32-token boundary.
+BUCKETS_TK = (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+
 
 @dataclass
 class Config:
@@ -53,6 +58,13 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return x * cos + rot * sin
 
 
+def _bucket_tk(tk: int) -> int:
+    for b in BUCKETS_TK:
+        if b >= tk:
+            return b
+    raise ValueError(f"Tk={tk} exceeds max bucket {BUCKETS_TK[-1]}")
+
+
 # --- KV cache ------------------------------------------------------------
 # A cache holds one (k, v) pair per layer, each of shape [B, Hkv, T_cached, Dh].
 # `None` entries mean the layer hasn't been populated yet (empty cache).
@@ -65,7 +77,7 @@ def empty_cache(cfg: Config) -> KVCache:
 
 class Layer:
     __slots__ = ("wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down", "ln1", "ln2",
-                 "wqkv", "w_gate_up", "npu")
+                 "wqkv", "w_gate_up", "npu", "npu_decode_cpu", "npu_decode_attention")
 
     def __init__(self, sd: dict, i: int):
         p = f"model.layers.{i}."
@@ -83,28 +95,43 @@ class Layer:
         self.wqkv = torch.cat([self.wq, self.wk, self.wv], dim=0)
         self.w_gate_up = torch.cat([self.w_gate, self.w_up], dim=0)
         self.npu: dict[str, object] | None = None  # filled by SmolLM when --npu
+        self.npu_decode_cpu = False
+        self.npu_decode_attention = False
+
+    def _use_npu(self, name: str, x: torch.Tensor) -> bool:
+        # Optional diagnostic/fast-chat fallback: decode is a single-row matmul
+        # per projection. On the current XRT path that means 120 tiny NPU
+        # launches per token, each padded to M=256, which is far slower than
+        # torch CPU matmul. The default stays full-NPU for projection ops.
+        M = x.reshape(-1, x.shape[-1]).shape[0]
+        return (
+            self.npu is not None
+            and name in self.npu
+            and (not self.npu_decode_cpu or M > 1)
+        )
 
     def _lin(self, name: str, x: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
         """F.linear(x, W) — routed through NPU if this layer has an NpuLinear."""
-        if self.npu is not None and name in self.npu:
+        if self._use_npu(name, x):
             return self.npu[name](x)
         return F.linear(x, W)
 
     def _fa_attention(
         self, q, k_exp, v_exp, start_pos: int,
         B: int, T: int, Tk: int, Hq: int, Dh: int,
+        bucket_kv: bool = False,
     ) -> torch.Tensor:
         """Run NPU FlashAttention for one whole layer in a single dispatch,
         batching all (B, Hq, Q-block) combinations.
 
-        Pads T to multiple of BR and Tk to multiple of BC. Padded K cols sit
-        past every real Q row's causal frontier, so the in-kernel causal mask
-        handles them naturally.
+        Pads T to a multiple of BR. Tk uses tight BC padding for prefill and
+        optional decode buckets. Padded K cols sit past every real Q row's
+        causal frontier, so the in-kernel causal mask handles them naturally.
         """
         attn = self.npu["attention"]
         BR, BC = attn.BR, attn.BC
         Tq_pad = ((T  + BR - 1) // BR) * BR
-        Tk_pad = ((Tk + BC - 1) // BC) * BC
+        Tk_pad = _bucket_tk(Tk) if bucket_kv else ((Tk + BC - 1) // BC) * BC
         n_q = Tq_pad // BR
 
         if Tq_pad > T:
@@ -142,7 +169,7 @@ class Layer:
         with profile("rms1"):
             h = rms_norm(x, self.ln1, cfg.rms_eps)
         with profile("qkv"):
-            if self.npu is not None and "wqkv" in self.npu:
+            if self._use_npu("wqkv", h):
                 qkv = self.npu["wqkv"](h)
                 Nq, Nk = Hq * Dh, Hkv * Dh
                 q = qkv[..., :Nq].view(B, T, Hq,  Dh).transpose(1, 2)
@@ -164,11 +191,18 @@ class Layer:
             v_exp = v.repeat_interleave(rep, dim=1)
             Tk = k_exp.shape[2]
         # Prefill (T>1) can route the whole attention body through a single
-        # fused FA kernel. Decode (T=1) stays on CPU — one dispatch per token
-        # with varying start_pos would mint a new xclbin each step as Tk grows.
-        if self.npu is not None and "attention" in self.npu and T > 1:
+        # fused FA kernel. Decode attention is optional: it is useful for
+        # full-NPU experiments, but it adds one dispatch per layer per token.
+        if (
+            self.npu is not None
+            and "attention" in self.npu
+            and (T > 1 or self.npu_decode_attention)
+        ):
             with profile("attn_npu"):
-                o = self._fa_attention(q, k_exp, v_exp, start_pos, B, T, Tk, Hq, Dh)
+                o = self._fa_attention(
+                    q, k_exp, v_exp, start_pos, B, T, Tk, Hq, Dh,
+                    bucket_kv=(T == 1 and self.npu_decode_attention),
+                )
         else:
             with profile("attn_cpu"):
                 att = torch.matmul(q, k_exp.transpose(-2, -1)) / math.sqrt(Dh)
@@ -187,7 +221,7 @@ class Layer:
         with profile("rms2"):
             h = rms_norm(x, self.ln2, cfg.rms_eps)
         with profile("gate_up"):
-            if self.npu is not None and "w_gate_up" in self.npu:
+            if self._use_npu("w_gate_up", h):
                 gu = self.npu["w_gate_up"](h)
                 gate = F.silu(gu[..., :cfg.ffn_dim])
                 up = gu[..., cfg.ffn_dim:]
@@ -215,15 +249,23 @@ class SmolLM:
         ops: tuple[str, ...] = ("wqkv", "wo", "w_gate_up", "w_down"),
         softmax: bool = False,
         attention: bool = True,
+        cpu_decode_fallback: bool = False,
+        decode_attention: bool = False,
     ) -> None:
         """Route NPU-offloadable layers. Each flag is independent.
 
         - ops: projection matmuls (NpuLinear, weight-bf16). Default uses
           fused QKV and gate/up projections — one dispatch each instead of
           three/two — to amortise per-op driver overhead.
-        - attention: fused FA (NpuAttention) replaces Q·K^T + softmax + ·V. Used
-          for prefill only (T>1); decode falls back to CPU to avoid xclbin
-          churn as Tk grows per token.
+        - attention: fused FA (NpuAttention) replaces Q·K^T + softmax + ·V.
+          By default it is used for prefill only (T>1); decode attention stays
+          on CPU unless decode_attention=True.
+        - cpu_decode_fallback: optional speed diagnostic that keeps prefill
+          offload enabled but routes single-token projection matmuls to CPU.
+          Leave false when testing the full-NPU projection path.
+        - decode_attention: route T=1 attention through NpuAttention too. This
+          is off by default because it adds per-token dispatches and may compile
+          a new FA xclbin when the KV length crosses a bucket boundary.
         - softmax: the old standalone NPU softmax path (projection-matmul +
           softmax, leaves Q·K^T and ·V on CPU). Kept available for comparison
           but a net regression end-to-end vs attention=True.
@@ -231,6 +273,8 @@ class SmolLM:
         from npu.linear import NpuLinear  # local import to keep CPU path zero-cost
         for layer in self.layers:
             layer.npu = {}
+            layer.npu_decode_cpu = cpu_decode_fallback
+            layer.npu_decode_attention = decode_attention
             for op in ops:
                 W = getattr(layer, op)
                 layer.npu[op] = NpuLinear(W)
@@ -304,12 +348,19 @@ def main():
     p.add_argument("--compare-cache", action="store_true", help="compare cache vs no-cache outputs")
     p.add_argument("--npu", action="store_true",
                    help="route matmuls through NPU (first call compiles, subsequent cached)")
+    p.add_argument("--cpu-decode-fallback", action="store_true",
+                   help="with --npu, route single-token decode projections to CPU")
+    p.add_argument("--npu-decode-attn", action="store_true",
+                   help="with --npu, route single-token attention through NpuAttention")
     args = p.parse_args()
 
     model, tok, hf = load(torch.float32)
     if args.npu:
         print("enabling NPU backend for all MLP + attention projections…")
-        model.enable_npu()
+        model.enable_npu(
+            cpu_decode_fallback=args.cpu_decode_fallback,
+            decode_attention=args.npu_decode_attn,
+        )
     ids = tok(args.prompt, return_tensors="pt").input_ids
 
     if args.check:

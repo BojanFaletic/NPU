@@ -2,7 +2,9 @@
 
 Running a Llama-style LLM on the AMD Ryzen AI NPU (XDNA 2 / Krackan Point),
 end to end, with hand-written kernels. The 135M model is the learning vehicle;
-the end goal is Qwen3-27B/32B running efficiently on the same laptop.
+the end goal is **`unsloth/Qwen3.6-35B-A3B-GGUF`** — a 35B MoE (≈3B active per
+token) running efficiently on the same laptop, with the NPU carrying the
+attention + expert matmul load.
 
 ## Status
 
@@ -161,27 +163,34 @@ uv run python npu/matmul_mc.py -M 512 -K 512 -N 512 -m 32 -k 64 -n 32 --cols 4
   i.e. `M % (m·8) == 0` for the default tb layout. `NpuLinear.Plan` pads
   accordingly (minimum M_pad = 256 with `m=32`).
 
-## Next session — wire FA into smollm + optimise
+## Roadmap — from SmolLM2-135M to Qwen3.6-35B-A3B
 
-FA streams K/V blocks with online softmax rescaling; correctness proven up
-to TK=512. Remaining work to get end-to-end wins:
+SmolLM2 is now end-to-end on NPU (projections fused + FA-2 multi-core,
+top-1 matches HF). Prefill is still 4–7× slower than CPU; decode is CPU.
+The ladder from here to `unsloth/Qwen3.6-35B-A3B-GGUF`:
 
-1. **Causal masking** — apply the causal mask in `attn_block` before the
-   per-row max/softmax. Needs the block's `(r_base, c_base)` absolute
-   positions; easiest is a scalar `start_pos` runtime arg into the kernel.
-2. **Multi-Q-block dispatch** — SmolLM2 prefill has Tq > BR once the prompt
-   is longer than 32 tokens. Either loop dispatches host-side (one per Q
-   block, streams the same K/V data each time — wasteful DMA) or extend the
-   kernel with an outer Q loop that re-uses K/V stream (harder: need state
-   per Q-block).
-3. **Multi-head batching / multi-core** — SmolLM2 has Hq=9 heads. With 4
-   compute cores, a 3+2+2+2 static head-partition matches cleanly. Needed
-   for end-to-end throughput to beat CPU.
-4. **Vectorise** — the scalar matmuls and the `exp_scalar` broadcast-exp2
-   are waste. Use `aie::mmul` and the row-wide `aie::exp2` from softmax.cc
-   idioms to bring the kernel toward the AIE's peak throughput.
-5. **Wire into `smollm.py`** — replace the CPU `Q·K^T`/softmax/`att·V` path
-   with `NpuAttention.run_one` per head. Verify top-1 matches HF + bench.
-
-After FA works end-to-end: quantization (`mm_bfp.cc`, int8 weights, 2×
-throughput + half the DMA), path toward Qwen3-27B.
+1. **Close the prefill gap on SmolLM2** — fixed per-dispatch overhead
+   dominates at short T. Options: merge FA + down-proj into one xclbin,
+   batch several layers' launches, or keep all weights device-resident
+   so only activations cross PCIe.
+2. **Decode path on NPU** — today decode falls back to CPU (T=1 softmax
+   + CPU attention). Need an FA-decode kernel (single Q row, TK=full KV)
+   and an `NpuLinear` fast path that amortises one xclbin across all
+   decode steps.
+3. **Quantized matmul** — `vendor/mlir-aie-src/aie_kernels/aie2p` has
+   `mm_bfp.cc` (block-fp) plus int8 variants. GGUF's Q4_K/Q5_K/Q8_0
+   weight layouts need a dequant/compute kernel on the AIE; this is the
+   single biggest win (≈4× DMA, ≈2× compute vs bf16) and the only way a
+   35B model fits alongside KV cache in 27 GiB of DRAM.
+4. **GGUF loader** — parse unsloth's Qwen3.6 GGUF, stream quantized
+   tensors straight into device-side tiled layouts. No bf16 round-trip.
+5. **Qwen3 architecture deltas** — GQA with different H_kv ratio,
+   RMSNorm placement, SwiGLU, rotary-freq base, **and MoE routing**
+   (top-k experts per token out of N). MoE means the per-token expert
+   matmuls change every step, which wrecks any "one xclbin per shape"
+   cache strategy — need a single templated expert-matmul xclbin plus
+   an on-device router.
+6. **Qwen3.6-35B-A3B end-to-end** — 3B active params per token keep the
+   per-step compute tractable on one NPU; the full 35B weight set stays
+   on disk/RAM, streamed by expert. Success metric: interactive decode
+   (≥5 tok/s) with top-1 matching the GGUF llama.cpp reference.
