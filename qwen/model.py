@@ -88,16 +88,20 @@ def build_config(r: GGUFReader) -> Config:
             layer_has_attn_q[i] = True
     is_attention = layer_has_attn_q
 
-    # Head counts from actual weight shapes (more reliable than metadata).
-    # Grab blk.<first attention layer>.attn_q and blk.0.attn_qkv for SSM.
+    # Head counts from actual weight shapes. Metadata head_count is OK here
+    # (16) but we cross-check against shapes.
+    #
+    # Qwen3-Next attention is *gated*: the attn_q projection outputs
+    #   [q (n_head * head_dim) | q_gate (n_head * head_dim)] = 2*n_head*head_dim
+    # so n_head must be derived from attn_output's input dim (which equals
+    # n_head * head_dim post-gate), not from attn_q's output dim.
     head_dim = int(_get(r, p + "attention.key_length"))
     n_head = None
     n_head_kv = None
     for t in r.tensors:
-        if t.name.endswith(".attn_q.weight"):
-            # GGML shape (in, out) = (d_model, n_head * head_dim)
-            out_dim = int(t.shape[1])
-            n_head = out_dim // head_dim
+        if t.name.endswith(".attn_output.weight"):
+            in_dim = int(t.shape[0])
+            n_head = in_dim // head_dim
             break
     for t in r.tensors:
         if t.name.endswith(".attn_k.weight"):
@@ -105,7 +109,6 @@ def build_config(r: GGUFReader) -> Config:
             n_head_kv = out_dim // head_dim
             break
     if n_head is None or n_head_kv is None:
-        # SSM-only file would hit this; this model always has some attn layers.
         raise ValueError("couldn't derive n_head / n_head_kv from shapes")
 
     return Config(
