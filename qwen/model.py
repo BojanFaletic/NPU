@@ -33,10 +33,9 @@ class Config:
     n_layer: int
     n_ctx_train: int
     d_model: int              # embedding_length
-    n_head: int               # Q heads (from weight shapes; metadata's
-                              # head_count is unreliable for this arch)
-    n_head_kv: int            # KV heads
-    head_dim: int             # qk head dim == v head dim
+    n_head: int               # attention: Q heads
+    n_head_kv: int            # attention: KV heads
+    head_dim: int             # attention: qk head dim == v head dim
     rms_eps: float
     rope_theta: float
     rope_dim: int             # partial rotary: only first rope_dim of head
@@ -48,9 +47,15 @@ class Config:
     eos_id: int
     pad_id: int | None
 
-    # Layer type discovered from tensor presence, not from metadata.
-    # True at index i iff blk.i has full attention (attn_q, attn_k, attn_v,
-    # attn_output). False → SSM block (attn_qkv fused + ssm_*).
+    # SSM (Gated DeltaNet) hparams — only the SSM blocks use these.
+    ssm_d_conv: int = 4       # conv1d kernel
+    ssm_d_inner: int = 4096   # total V dim (d_inner); head_v_dim = d_inner / n_v_heads
+    ssm_d_state: int = 128    # head_k_dim == head_v_dim for qwen35moe
+    ssm_n_k_heads: int = 16   # num K heads (ssm_n_group); V heads broadcast from these
+    ssm_n_v_heads: int = 32   # num V heads (ssm_dt_rank); also the "head count" for α/β
+
+    # Layer type. recurrent_layer_arr[i] = ((i+1) % 4 != 0) per llama.cpp for
+    # qwen35moe. Cross-checked against tensor presence (attn_q present = attn).
     is_attention: list[bool] = field(default_factory=list)
 
     @property
@@ -125,6 +130,11 @@ def build_config(r: GGUFReader) -> Config:
         n_expert=int(_get(r, p + "expert_count")),
         n_expert_used=int(_get(r, p + "expert_used_count")),
         d_expert_ff=int(_get(r, p + "expert_feed_forward_length")),
+        ssm_d_conv=int(_get(r, p + "ssm.conv_kernel") or 4),
+        ssm_d_inner=int(_get(r, p + "ssm.inner_size") or 4096),
+        ssm_d_state=int(_get(r, p + "ssm.state_size") or 128),
+        ssm_n_k_heads=int(_get(r, p + "ssm.group_count") or 16),
+        ssm_n_v_heads=int(_get(r, p + "ssm.time_step_rank") or 32),
         vocab_size=int(_get(r, "tokenizer.ggml.tokens") is not None
                        and len(_get(r, "tokenizer.ggml.tokens")) or 0),
         bos_id=int(_get(r, "tokenizer.ggml.bos_token_id") or 0),
