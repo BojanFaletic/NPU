@@ -395,15 +395,26 @@ class MoELayer:
         )
 
     def dequant_experts(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Dequantize the 3 expert-stack tensors for this layer. With the
-        reversed-reshape convention in TensorStore.get, shapes are already
-        (n_expert, out, in): (256, 512, 2048) for gate/up, (256, 2048, 512)
-        for down. Caller should drop references before the next call."""
+        """Dequantize all 3 stacked expert tensors at once. Slow (~9 s/layer)
+        and only used by tests. The hot path goes through dequant_one()."""
         p = f"blk.{self.i}."
         g = _w(self.ts, p + "ffn_gate_exps.weight", dtype=self.dtype)
         u = _w(self.ts, p + "ffn_up_exps.weight", dtype=self.dtype)
         d = _w(self.ts, p + "ffn_down_exps.weight", dtype=self.dtype)
         return g, u, d
+
+    def dequant_one(self, expert_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Dequantize *one* expert's gate/up/down — ~36 ms for IQ3_XXS vs
+        ~9 s for the full stack. Returns (gate[ff,D], up[ff,D], down[D,ff])."""
+        p = f"blk.{self.i}."
+        g = self.ts.get_expert(p + "ffn_gate_exps.weight", expert_idx)
+        u = self.ts.get_expert(p + "ffn_up_exps.weight", expert_idx)
+        d = self.ts.get_expert(p + "ffn_down_exps.weight", expert_idx)
+        return (
+            torch.from_numpy(g.copy()).to(self.dtype),
+            torch.from_numpy(u.copy()).to(self.dtype),
+            torch.from_numpy(d.copy()).to(self.dtype),
+        )
 
 
 def moe_forward(x: torch.Tensor, layer: MoELayer, cfg: Config) -> torch.Tensor:
@@ -424,16 +435,16 @@ def moe_forward(x: torch.Tensor, layer: MoELayer, cfg: Config) -> torch.Tensor:
     shared_scalar_gate = torch.sigmoid(x_flat @ layer.w_gate_inp_sh)  # [BT]
     shared_out = shared_out * shared_scalar_gate.unsqueeze(-1)
 
-    # --- Routed experts.
-    router_logits = F.linear(x_flat, layer.w_router)        # [BT, E]
-    topk_vals, topk_ids = router_logits.topk(K, dim=-1)     # [BT, K]
-    topk_w = F.softmax(topk_vals.float(), dim=-1).to(x.dtype)
-
-    # Dequant expert weights for this layer only.
-    w_gate_exps, w_up_exps, w_down_exps = layer.dequant_experts()
+    # --- Routed experts. Match llama.cpp's qwen35moe ordering: softmax over
+    # all E experts first, then top-K, then renormalize the top-K weights.
+    router_logits = F.linear(x_flat, layer.w_router)              # [BT, E]
+    probs = F.softmax(router_logits.float(), dim=-1).to(x.dtype)  # [BT, E]
+    topk_vals, topk_ids = probs.topk(K, dim=-1)                   # [BT, K]
+    topk_w = topk_vals / topk_vals.sum(-1, keepdim=True).clamp_min(1e-20)
 
     out_routed = torch.zeros_like(x_flat)
-    # Only iterate experts that at least one token picked.
+    # Dequantize only the experts that at least one token picked. With T=1
+    # that's exactly K=8; with longer prefills it stays bounded by min(K*T, E).
     picked = torch.unique(topk_ids)
     for e in picked.tolist():
         mask = (topk_ids == e)
@@ -443,15 +454,14 @@ def moe_forward(x: torch.Tensor, layer: MoELayer, cfg: Config) -> torch.Tensor:
         xe = x_flat[tok_idx]
         we = topk_w[tok_idx, slot_idx]
 
-        g = F.linear(xe, w_gate_exps[e])
-        u = F.linear(xe, w_up_exps[e])
+        wg, wu, wd = layer.dequant_one(int(e))
+        g = F.linear(xe, wg)
+        u = F.linear(xe, wu)
         y = F.silu(g) * u
-        y = F.linear(y, w_down_exps[e])
+        y = F.linear(y, wd)
+        del wg, wu, wd
 
         out_routed.index_add_(0, tok_idx, y * we.unsqueeze(-1))
-
-    # Drop the big tensors so they're GC'd before the next layer.
-    del w_gate_exps, w_up_exps, w_down_exps
 
     return (out_routed + shared_out).view(B, T, D)
 

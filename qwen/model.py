@@ -227,6 +227,55 @@ class TensorStore:
     def cache_bytes(self) -> int:
         return sum(a.nbytes for a in self._cache.values())
 
+    def get_expert(self, name: str, expert_idx: int,
+                   dtype: str = "fp32") -> np.ndarray:
+        """Dequantize a *single* expert from a stacked expert tensor.
+
+        Stacked tensors have ggml shape (in, out, n_expert), with n_expert as
+        the slowest-varying axis — so each expert's quantized bytes are
+        contiguous on disk. For block-quantized formats (IQ3_XXS / Q3_K /
+        IQ4_XS) the per-expert chunk lands on block boundaries because
+        out*in is a multiple of the block size (256 elements).
+
+        Returns shape (out, in) — torch's Linear.weight convention. ~32× faster
+        than dequantizing all 256 experts when only 8 are routed per token.
+        """
+        if dtype not in ("fp32", "fp16", "bf16"):
+            raise ValueError(dtype)
+
+        t = self._by_name.get(name)
+        if t is None:
+            raise KeyError(name)
+
+        ggml_shape = [int(x) for x in t.shape]
+        if len(ggml_shape) != 3:
+            raise ValueError(f"{name} is not a stacked expert tensor "
+                             f"(got shape {ggml_shape})")
+        n_expert = ggml_shape[-1]
+        if not 0 <= expert_idx < n_expert:
+            raise IndexError(expert_idx)
+
+        # gguf-py stores stacked tensors with shape (n_expert, rows_per_expert,
+        # bytes_per_row) for quantized types. Slicing axis 0 gives one expert's
+        # raw bytes already in the (rows, bytes_per_row) layout dequantize wants.
+        chunk = t.data[expert_idx]
+
+        if t.tensor_type == GGMLQuantizationType.F32:
+            arr = np.asarray(chunk).view(np.float32).ravel()
+        else:
+            arr = dequantize(chunk, t.tensor_type).astype(np.float32, copy=False)
+
+        # Per-expert ggml shape is (in, out); numpy reshape with reversed dims
+        # produces (out, in) — matches torch's Linear.weight convention.
+        per_expert_shape = tuple(reversed(ggml_shape[:2]))
+        arr = arr.reshape(per_expert_shape)
+
+        if dtype == "fp16":
+            arr = arr.astype(np.float16)
+        elif dtype == "bf16":
+            arr = to_bf16(arr)
+        return arr
+
 
 def to_bf16(arr_fp32: np.ndarray) -> np.ndarray:
     """fp32 → bf16 stored as uint16. Round-to-nearest-even via the top 16 bits
