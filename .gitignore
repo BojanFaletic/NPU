@@ -6,3 +6,5 @@ __pycache__/
 .pytest_cache/
 npu/build/
 vendor/
+*.gguf
+qwen/ref_cache/
