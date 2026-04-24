@@ -77,9 +77,15 @@ def compare_layer(ts: TensorStore, dump: Path, i: int,
 
     if is_attn:
         layer = AttnLayer.load(ts, i)
-        if "attn_o" in npu:
+        if "attn_o" in npu or "attn_qkv" in npu:
             from npu.mv import NpuMatVec
-            layer.npu = {"wo": NpuMatVec(layer.wo)}
+            layer.npu = {}
+            if "attn_o" in npu:
+                layer.npu["wo"] = NpuMatVec(layer.wo)
+            if "attn_qkv" in npu:
+                layer.npu["wq"] = NpuMatVec(layer.wq)
+                layer.npu["wk"] = NpuMatVec(layer.wk)
+                layer.npu["wv"] = NpuMatVec(layer.wv)
     else:
         layer = SSMLayer.load(ts, i)
 
@@ -293,9 +299,10 @@ def main() -> int:
                     help="how many layers to chain (default: all 40)")
     ap.add_argument("--npu", default=None,
                     help="comma-sep ops to route through XDNA 2 NpuMatVec "
-                         "instead of F.linear (router, shexp, attn_o). "
-                         "router/shexp are MoE-side (--moe-layer); attn_o "
-                         "is mixer-side (--layers / default).")
+                         "instead of F.linear (router, shexp, attn_o, "
+                         "attn_qkv). router/shexp are MoE-side "
+                         "(--moe-layer); attn_o/attn_qkv are mixer-side "
+                         "(--layers / default).")
     args = ap.parse_args()
 
     dump = Path(args.dump)

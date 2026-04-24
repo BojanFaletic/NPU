@@ -140,12 +140,24 @@ def attn_forward(
     #   [q_h0 | gate_h0 | q_h1 | gate_h1 | ... | q_h{Hq-1} | gate_h{Hq-1}]
     # (llama.cpp qwen35moe.cpp uses stride n_embd_head*2 per head; gate view
     # is offset by n_embd_head within each slot.)
-    q_full = F.linear(h, layer.wq)           # [B, T, 2*Hq*Dh]
+    npu_qkv = (
+        layer.npu is not None
+        and "wq" in layer.npu
+        and B == 1 and T == 1
+    )
+    if npu_qkv:
+        q_full = layer.npu["wq"](h.reshape(-1)).reshape(1, 1, 2 * Hq * Dh)
+        k_raw = layer.npu["wk"](h.reshape(-1)).reshape(1, 1, Hkv * Dh)
+        v_raw = layer.npu["wv"](h.reshape(-1)).reshape(1, 1, Hkv * Dh)
+    else:
+        q_full = F.linear(h, layer.wq)           # [B, T, 2*Hq*Dh]
+        k_raw = F.linear(h, layer.wk)
+        v_raw = F.linear(h, layer.wv)
     q_full = q_full.view(B, T, Hq, 2, Dh)
     q = q_full[..., 0, :]                     # [B, T, Hq, Dh]
     q_gate = q_full[..., 1, :]                # [B, T, Hq, Dh]
-    k = F.linear(h, layer.wk).view(B, T, Hkv, Dh)
-    v = F.linear(h, layer.wv).view(B, T, Hkv, Dh)
+    k = k_raw.view(B, T, Hkv, Dh)
+    v = v_raw.view(B, T, Hkv, Dh)
 
     # Per-head Q/K RMSNorm (over head_dim).
     q = rms_norm(q, layer.q_norm, cfg.rms_eps)
@@ -548,13 +560,15 @@ def enable_npu(model: Model, ops: Sequence[str] = ("router",)) -> None:
         shexp     — shared expert gate/up/down (40 layers; gate/up share
                     shape [512, 2048], down is [2048, 512])
         attn_o    — attention output proj (10 attn layers, [2048, 4096])
+        attn_qkv  — attention Q/K/V projections (10 attn layers; Q is
+                    [8192, 2048], K/V share [512, 2048] with shexp gate)
 
     Each new (out, in) shape mints one xclbin (~30 s cold, cached after).
     NpuMatVec is T=1-only; the dispatch path falls back to F.linear for T>1.
     """
     from npu.mv import NpuMatVec
 
-    valid = {"router", "shexp", "attn_o"}
+    valid = {"router", "shexp", "attn_o", "attn_qkv"}
     unknown = set(ops) - valid
     if unknown:
         raise ValueError(f"unknown NPU ops: {sorted(unknown)} (valid: {sorted(valid)})")
@@ -575,6 +589,13 @@ def enable_npu(model: Model, ops: Sequence[str] = ("router",)) -> None:
             if core.npu is None:
                 core.npu = {}
             core.npu["wo"] = NpuMatVec(core.wo)
+        if "attn_qkv" in ops and isinstance(core, AttnLayer):
+            # Q (8192, 2048) is new; K/V (512, 2048) share the shexp gate xclbin.
+            if core.npu is None:
+                core.npu = {}
+            core.npu["wq"] = NpuMatVec(core.wq)
+            core.npu["wk"] = NpuMatVec(core.wk)
+            core.npu["wv"] = NpuMatVec(core.wv)
 
 
 def forward(
