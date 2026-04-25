@@ -25,6 +25,7 @@ import pyxrt
 ROOT = Path(__file__).parent
 CACHE = ROOT / "build" / "quant_mv_iq4_cache"
 KERNEL_SRC = ROOT / "quant_mv_iq4_kernel.cc"
+_COMPILED_CACHE: dict[tuple[int, int, int, int], "Compiled"] = {}
 
 BLK = 256
 RAW_B_BYTES = 136
@@ -141,6 +142,11 @@ class Compiled:
 
 def build_xclbin(M: int, K: int, m: int = 32, n_cores: int = 4) -> Compiled:
     M_pad = ((M + m * n_cores - 1) // (m * n_cores)) * (m * n_cores)
+    key = (M_pad, K, m, n_cores)
+    cached = _COMPILED_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     tag = f"qmv_iq4_{M_pad}x{K}_m{m}_c{n_cores}"
     build = CACHE / tag
     build.mkdir(parents=True, exist_ok=True)
@@ -159,8 +165,10 @@ def build_xclbin(M: int, K: int, m: int = 32, n_cores: int = 4) -> Compiled:
         mlir = build / "aie.mlir"
         generate_mlir(M_pad, K, m, n_cores, obj.name, mlir)
         compile_xclbin(mlir, obj, build)
-    return Compiled(M_pad, K, m, n_cores, xclbin,
-                    np.fromfile(insts, dtype=np.uint32))
+    compiled = Compiled(M_pad, K, m, n_cores, xclbin,
+                        np.fromfile(insts, dtype=np.uint32))
+    _COMPILED_CACHE[key] = compiled
+    return compiled
 
 
 def _repack_iq4_raw(raw: np.ndarray, M: int, K: int) -> np.ndarray:

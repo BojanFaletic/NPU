@@ -30,6 +30,7 @@ import pyxrt
 ROOT = Path(__file__).parent
 CACHE = ROOT / "build" / "mlp_cache"
 KERNEL_SRC = ROOT / "mlp_kernel.cc"
+_COMPILED_CACHE: dict[tuple[int, int, int, int, int, int, int], "Compiled"] = {}
 
 
 def compile_kernel(m: int, k: int, act: int, build_dir: Path) -> Path:
@@ -285,6 +286,11 @@ def build_xclbin(
     n_cores: int = 4,
 ) -> Compiled:
     down_m = ((hidden + m * n_cores - 1) // (m * n_cores)) * (m * n_cores)
+    key = (hidden, ffn, down_m, m, k, act, n_cores)
+    cached = _COMPILED_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     tag = f"mlp_h{hidden}_f{ffn}_down{down_m}_{m}x{k}_a{act}_c{n_cores}"
     build = CACHE / tag
     build.mkdir(parents=True, exist_ok=True)
@@ -303,7 +309,10 @@ def build_xclbin(
         mlir = build / "aie.mlir"
         generate_mlir(hidden, ffn, down_m, m, k, act, n_cores, obj.name, mlir)
         compile_xclbin(mlir, obj, build)
-    return Compiled(hidden, ffn, down_m, m, k, act, n_cores, xclbin, np.fromfile(insts, dtype=np.uint32))
+    compiled = Compiled(hidden, ffn, down_m, m, k, act, n_cores, xclbin,
+                        np.fromfile(insts, dtype=np.uint32))
+    _COMPILED_CACHE[key] = compiled
+    return compiled
 
 
 class _XrtCtx:

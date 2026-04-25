@@ -40,6 +40,7 @@ ROOT = Path(__file__).parent
 CACHE = ROOT / "build" / "quant_mv_cache"
 KERNEL_SRC = ROOT / "quant_mv_kernel.cc"
 TABLES_HDR = ROOT / "iq3_xxs_tables.h"
+_COMPILED_CACHE: dict[tuple[int, int, int, int], "Compiled"] = {}
 
 BLK = 256          # K elements per IQ3_XXS block
 B_BYTES = 100      # bytes per block (host-preprocessed: fp32 d, 64 qs, 32 scales)
@@ -188,6 +189,11 @@ class Compiled:
 
 def build_xclbin(M: int, K: int, m: int = 64, n_cores: int = 8) -> Compiled:
     M_pad = ((M + m * n_cores - 1) // (m * n_cores)) * (m * n_cores)
+    key = (M_pad, K, m, n_cores)
+    cached = _COMPILED_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     tag = f"qmv_{M_pad}x{K}_m{m}_c{n_cores}"
     build = CACHE / tag
     build.mkdir(parents=True, exist_ok=True)
@@ -208,8 +214,10 @@ def build_xclbin(M: int, K: int, m: int = 64, n_cores: int = 8) -> Compiled:
         mlir = build / "aie.mlir"
         generate_mlir(M_pad, K, m, n_cores, obj.name, mlir)
         compile_xclbin(mlir, obj, build)
-    return Compiled(M_pad, K, m, n_cores, xclbin,
-                    np.fromfile(insts, dtype=np.uint32))
+    compiled = Compiled(M_pad, K, m, n_cores, xclbin,
+                        np.fromfile(insts, dtype=np.uint32))
+    _COMPILED_CACHE[key] = compiled
+    return compiled
 
 
 # ---------------------------------------------------------------------------
