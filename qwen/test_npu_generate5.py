@@ -14,6 +14,7 @@ ambiguous branch are not compared because the sequence context has diverged.
 
 Run:
     PYTHONPATH=. uv run python qwen/test_npu_generate5.py
+    PYTHONPATH=. uv run python qwen/test_npu_generate5.py --profile
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ import gc
 import resource
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -33,6 +35,7 @@ sys.path.insert(0, str(ROOT))
 
 from qwen.forward import Model, enable_npu, forward
 from qwen.model import TensorStore
+from npu.profiler import PROF, profile
 
 
 DEFAULT_NPU_OPS = "router,shexp,experts,attn_o,attn_qkv,ssm"
@@ -202,37 +205,47 @@ def run_generate(
     model: Model,
     prompt: list[int],
     n_gen: int,
+    *,
+    profile_decode_only: bool = False,
 ) -> Trace:
     rows: list[torch.Tensor] = []
     generated: list[int] = []
 
-    t0 = time.time()
-    logits, kvs, ssms = forward(model, prompt, start_pos=0)
-    mark(f"{label}.prefill", t0)
-    for row in logits:
-        rows.append(row.detach().float().cpu().clone())
-
-    prev_logits = rows[-1]
-    for step in range(n_gen):
-        nxt = int(prev_logits.argmax().item())
-        generated.append(nxt)
-        print(f"{label} gen step={step} tok={nxt}")
-
-        # Generating N tokens only requires N-1 decode forwards after the
-        # prefill logits. The final token is validated as an ID, without asking
-        # the model for an uncached next-logit row.
-        if step + 1 == n_gen:
-            break
-
-        start = len(prompt) + step
+    whole_run = nullcontext() if profile_decode_only else profile(f"{label}.total")
+    with whole_run:
         t0 = time.time()
-        logits, kvs, ssms = forward(
-            model, [nxt], start_pos=start,
-            kv_caches=kvs, ssm_states=ssms,
-        )
-        mark(f"{label}.decode.{step}", t0)
-        prev_logits = logits[-1].detach().float().cpu().clone()
-        rows.append(prev_logits)
+        with profile(f"{label}.prefill.total"):
+            logits, kvs, ssms = forward(model, prompt, start_pos=0)
+        mark(f"{label}.prefill", t0)
+        for row in logits:
+            rows.append(row.detach().float().cpu().clone())
+
+        if profile_decode_only:
+            PROF.reset()
+
+        prev_logits = rows[-1]
+        with profile(f"{label}.decode.total"):
+            for step in range(n_gen):
+                nxt = int(prev_logits.argmax().item())
+                generated.append(nxt)
+                print(f"{label} gen step={step} tok={nxt}")
+
+                # Generating N tokens only requires N-1 decode forwards after the
+                # prefill logits. The final token is validated as an ID, without asking
+                # the model for an uncached next-logit row.
+                if step + 1 == n_gen:
+                    break
+
+                start = len(prompt) + step
+                t0 = time.time()
+                with profile(f"{label}.decode.forward"):
+                    logits, kvs, ssms = forward(
+                        model, [nxt], start_pos=start,
+                        kv_caches=kvs, ssm_states=ssms,
+                    )
+                mark(f"{label}.decode.{step}", t0)
+                prev_logits = logits[-1].detach().float().cpu().clone()
+                rows.append(prev_logits)
 
     return Trace(generated=generated, logits=rows)
 
@@ -260,10 +273,17 @@ def main() -> int:
     ap.add_argument("--full-check", action="store_true",
                     help="run the slower CPU baseline and require cached "
                          "llama.cpp agreement")
+    ap.add_argument("--profile", nargs="?", choices=("decode", "all"),
+                    const="decode", default=None,
+                    help="print profiler timings; plain --profile reports "
+                         "decode-only timings, --profile all includes prefill")
     args = ap.parse_args()
     if args.full_check:
         args.baseline = "cpu"
         args.require_oracle = True
+    if args.profile:
+        PROF.reset()
+        PROF.enable()
 
     cache = Path(args.cache)
     prompt = np.load(cache / "prompt_tokens.npy").astype(np.int64).tolist()
@@ -309,7 +329,12 @@ def main() -> int:
             t0 = time.time()
             enable_npu(model, ops=ops, expert_cache_limit=args.expert_cache_limit)
             mark("enable_npu", t0)
-        npu = run_generate("npu", model, prompt, args.n_gen)
+        if args.profile:
+            PROF.reset()
+        npu = run_generate(
+            "npu", model, prompt, args.n_gen,
+            profile_decode_only=(args.profile == "decode"),
+        )
 
         if args.baseline == "llama":
             ok = compare_oracle_trace(
@@ -344,6 +369,10 @@ def main() -> int:
         f"limit={args.max_rss_gib:.2f} GiB {'OK' if mem_ok else 'FAIL'}"
     )
     print(f"total time={time.time() - t_all:.2f}s")
+    if args.profile:
+        label = "npu.decode.total" if args.profile == "decode" else "npu.total"
+        print(f"\n== profiler ({args.profile}) ==")
+        PROF.report(total_label=label)
     return 0 if ok and mem_ok else 1
 
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -26,6 +27,12 @@ import torch
 import torch.nn.functional as F
 
 from qwen.model import Config, TensorStore, from_bf16
+
+try:
+    from npu.profiler import profile
+except ModuleNotFoundError:
+    def profile(_name: str):
+        return nullcontext()
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +143,8 @@ def attn_forward(
     B, T, D = x.shape
     Hq, Hkv, Dh, rd = cfg.n_head, cfg.n_head_kv, cfg.head_dim, cfg.rope_dim
 
-    h = rms_norm(x, layer.attn_norm, cfg.rms_eps)
+    with profile("attn.norm"):
+        h = rms_norm(x, layer.attn_norm, cfg.rms_eps)
 
     # Gated Q with *interleaved per-head* layout:
     #   [q_h0 | gate_h0 | q_h1 | gate_h1 | ... | q_h{Hq-1} | gate_h{Hq-1}]
@@ -147,72 +155,77 @@ def attn_forward(
         and "wq" in layer.npu
         and B == 1 and T == 1
     )
-    if npu_qkv:
-        q_full = layer.npu["wq"](h.reshape(-1)).reshape(1, 1, 2 * Hq * Dh)
-        k_raw = layer.npu["wk"](h.reshape(-1)).reshape(1, 1, Hkv * Dh)
-        v_raw = layer.npu["wv"](h.reshape(-1)).reshape(1, 1, Hkv * Dh)
-    else:
-        q_full = F.linear(h, layer.wq)           # [B, T, 2*Hq*Dh]
-        k_raw = F.linear(h, layer.wk)
-        v_raw = F.linear(h, layer.wv)
-    q_full = q_full.view(B, T, Hq, 2, Dh)
-    q = q_full[..., 0, :]                     # [B, T, Hq, Dh]
-    q_gate = q_full[..., 1, :]                # [B, T, Hq, Dh]
-    k = k_raw.view(B, T, Hkv, Dh)
-    v = v_raw.view(B, T, Hkv, Dh)
+    with profile("attn.qkv"):
+        if npu_qkv:
+            q_full = layer.npu["wq"](h.reshape(-1)).reshape(1, 1, 2 * Hq * Dh)
+            k_raw = layer.npu["wk"](h.reshape(-1)).reshape(1, 1, Hkv * Dh)
+            v_raw = layer.npu["wv"](h.reshape(-1)).reshape(1, 1, Hkv * Dh)
+        else:
+            q_full = F.linear(h, layer.wq)           # [B, T, 2*Hq*Dh]
+            k_raw = F.linear(h, layer.wk)
+            v_raw = F.linear(h, layer.wv)
 
-    # Per-head Q/K RMSNorm (over head_dim).
-    q = rms_norm(q, layer.q_norm, cfg.rms_eps)
-    k = rms_norm(k, layer.k_norm, cfg.rms_eps)
+    with profile("attn.core"):
+        q_full = q_full.view(B, T, Hq, 2, Dh)
+        q = q_full[..., 0, :]                     # [B, T, Hq, Dh]
+        q_gate = q_full[..., 1, :]                # [B, T, Hq, Dh]
+        k = k_raw.view(B, T, Hkv, Dh)
+        v = v_raw.view(B, T, Hkv, Dh)
 
-    # Partial RoPE at absolute positions start_pos..start_pos+T.
-    cos_slice = cos[start_pos: start_pos + T]  # [T, rope_dim]
-    sin_slice = sin[start_pos: start_pos + T]
-    q = apply_partial_rope(q, cos_slice, sin_slice, rd)
-    k = apply_partial_rope(k, cos_slice, sin_slice, rd)
+        # Per-head Q/K RMSNorm (over head_dim).
+        q = rms_norm(q, layer.q_norm, cfg.rms_eps)
+        k = rms_norm(k, layer.k_norm, cfg.rms_eps)
 
-    # GQA repeat: [B, T, Hkv, Dh] -> [B, T, Hq, Dh] by repeating each KV head.
-    rep = Hq // Hkv
-    k = k.repeat_interleave(rep, dim=2)
-    v = v.repeat_interleave(rep, dim=2)
+        # Partial RoPE at absolute positions start_pos..start_pos+T.
+        cos_slice = cos[start_pos: start_pos + T]  # [T, rope_dim]
+        sin_slice = sin[start_pos: start_pos + T]
+        q = apply_partial_rope(q, cos_slice, sin_slice, rd)
+        k = apply_partial_rope(k, cos_slice, sin_slice, rd)
 
-    # KV cache concat (B, T_cached + T, Hq, Dh).
-    if kv_cache is not None:
-        k_prev, v_prev = kv_cache
-        k = torch.cat([k_prev, k], dim=1)
-        v = torch.cat([v_prev, v], dim=1)
-    new_cache = (k, v)
+        # GQA repeat: [B, T, Hkv, Dh] -> [B, T, Hq, Dh] by repeating each KV head.
+        rep = Hq // Hkv
+        k = k.repeat_interleave(rep, dim=2)
+        v = v.repeat_interleave(rep, dim=2)
 
-    # Scaled dot-product attention with causal mask. [B, Hq, Tq, Tk].
-    q_btHD = q.transpose(1, 2)                  # [B, Hq, T, Dh]
-    k_btHD = k.transpose(1, 2)                  # [B, Hq, Tk, Dh]
-    v_btHD = v.transpose(1, 2)
-    scores = torch.matmul(q_btHD, k_btHD.transpose(-2, -1)) / (Dh ** 0.5)
+        # KV cache concat (B, T_cached + T, Hq, Dh).
+        if kv_cache is not None:
+            k_prev, v_prev = kv_cache
+            k = torch.cat([k_prev, k], dim=1)
+            v = torch.cat([v_prev, v], dim=1)
+        new_cache = (k, v)
 
-    Tk = k_btHD.shape[-2]
-    # Causal mask: row t (absolute start_pos + t) attends to cols <= start_pos + t.
-    if T > 1:
-        rows = torch.arange(T) + start_pos
-        cols = torch.arange(Tk)
-        mask = cols[None, :] > rows[:, None]       # [T, Tk]
-        scores = scores.masked_fill(mask, float("-inf"))
+        # Scaled dot-product attention with causal mask. [B, Hq, Tq, Tk].
+        q_btHD = q.transpose(1, 2)                  # [B, Hq, T, Dh]
+        k_btHD = k.transpose(1, 2)                  # [B, Hq, Tk, Dh]
+        v_btHD = v.transpose(1, 2)
+        scores = torch.matmul(q_btHD, k_btHD.transpose(-2, -1)) / (Dh ** 0.5)
 
-    attn = F.softmax(scores.float(), dim=-1).to(q.dtype)
-    out = torch.matmul(attn, v_btHD)             # [B, Hq, T, Dh]
-    out = out.transpose(1, 2).contiguous()        # [B, T, Hq, Dh]
+        Tk = k_btHD.shape[-2]
+        # Causal mask: row t (absolute start_pos + t) attends to cols <= start_pos + t.
+        if T > 1:
+            rows = torch.arange(T) + start_pos
+            cols = torch.arange(Tk)
+            mask = cols[None, :] > rows[:, None]       # [T, Tk]
+            scores = scores.masked_fill(mask, float("-inf"))
 
-    # Gated attention: multiply by sigmoid(q_gate) per-head per-dim before wo.
-    # (qwen35moe.cpp: gate_sigmoid = ggml_sigmoid(gate); cur = cur * gate_sigmoid)
-    out = out * torch.sigmoid(q_gate)             # [B, T, Hq, Dh]
-    out = out.view(B, T, Hq * Dh)
-    if (
-        layer.npu is not None
-        and "wo" in layer.npu
-        and B == 1 and T == 1
-    ):
-        out = layer.npu["wo"](out.reshape(-1)).reshape(1, 1, D)
-    else:
-        out = F.linear(out, layer.wo)
+        attn = F.softmax(scores.float(), dim=-1).to(q.dtype)
+        out = torch.matmul(attn, v_btHD)             # [B, Hq, T, Dh]
+        out = out.transpose(1, 2).contiguous()        # [B, T, Hq, Dh]
+
+        # Gated attention: multiply by sigmoid(q_gate) per-head per-dim before wo.
+        # (qwen35moe.cpp: gate_sigmoid = ggml_sigmoid(gate); cur = cur * gate_sigmoid)
+        out = out * torch.sigmoid(q_gate)             # [B, T, Hq, Dh]
+        out = out.view(B, T, Hq * Dh)
+
+    with profile("attn.out_proj"):
+        if (
+            layer.npu is not None
+            and "wo" in layer.npu
+            and B == 1 and T == 1
+        ):
+            out = layer.npu["wo"](out.reshape(-1)).reshape(1, 1, D)
+        else:
+            out = F.linear(out, layer.wo)
 
     return out, new_cache
 
@@ -296,7 +309,8 @@ def ssm_forward(
 
     # attn_norm applies to SSM input too (same as for attention layers — in
     # qwen35moe.cpp it's applied *outside* the mixer call for both branches).
-    h = rms_norm(x, layer.attn_norm, cfg.rms_eps)
+    with profile("ssm.norm"):
+        h = rms_norm(x, layer.attn_norm, cfg.rms_eps)
 
     # --- Input projections ---------------------------------------------------
     npu_ssm = (
@@ -304,21 +318,23 @@ def ssm_forward(
         and "w_in" in layer.npu
         and B == 1 and T == 1
     )
-    if npu_ssm:
-        qkv_mixed = layer.npu["w_in"](h.reshape(-1)).reshape(1, 1, conv_ch)
-        z = layer.npu["w_gate"](h.reshape(-1)).reshape(1, 1, d_inner)
-    else:
-        qkv_mixed = F.linear(h, layer.w_in)          # [B, T, 8192]
-        z = F.linear(h, layer.w_gate)                # [B, T, 4096]
+    with profile("ssm.in_proj"):
+        if npu_ssm:
+            qkv_mixed = layer.npu["w_in"](h.reshape(-1)).reshape(1, 1, conv_ch)
+            z = layer.npu["w_gate"](h.reshape(-1)).reshape(1, 1, d_inner)
+        else:
+            qkv_mixed = F.linear(h, layer.w_in)          # [B, T, 8192]
+            z = F.linear(h, layer.w_gate)                # [B, T, 4096]
 
     # --- α, β per head per token --------------------------------------------
     # alpha_proj → (B, T, Hv); add dt_bias; softplus; multiply by a_coef.
-    alpha_raw = F.linear(h, layer.alpha)          # [B, T, Hv]
-    beta_raw = F.linear(h, layer.beta)            # [B, T, Hv]
-    alpha_biased = alpha_raw + layer.dt_bias
-    alpha_sp = F.softplus(alpha_biased)
-    g = alpha_sp * layer.a                        # [B, T, Hv]   — the "log decay"
-    beta = torch.sigmoid(beta_raw)                # [B, T, Hv]
+    with profile("ssm.alpha_beta"):
+        alpha_raw = F.linear(h, layer.alpha)          # [B, T, Hv]
+        beta_raw = F.linear(h, layer.beta)            # [B, T, Hv]
+        alpha_biased = alpha_raw + layer.dt_bias
+        alpha_sp = F.softplus(alpha_biased)
+        g = alpha_sp * layer.a                        # [B, T, Hv]   — the "log decay"
+        beta = torch.sigmoid(beta_raw)                # [B, T, Hv]
 
     # --- Depthwise conv1d with state -----------------------------------------
     # qkv_mixed along T convolved with layer.conv1d (per-channel k=4).
@@ -330,74 +346,78 @@ def ssm_forward(
     else:
         conv_state, rec_state = ssm_state
 
-    # Transpose qkv_mixed to [B, conv_ch, T] for conv.
-    qkv_bt = qkv_mixed.transpose(1, 2).contiguous()        # [B, conv_ch, T]
-    conv_in = torch.cat([conv_state, qkv_bt], dim=-1)      # [B, conv_ch, T + k-1]
-    w_conv = layer.conv1d.unsqueeze(1)                      # [conv_ch, 1, conv_k]
-    conv_out = F.conv1d(conv_in, w_conv, groups=conv_ch)    # [B, conv_ch, T]
-    # Update conv_state: last (conv_k - 1) columns of conv_in.
-    new_conv_state = conv_in[..., -(conv_k - 1):].contiguous()
-    conv_out = F.silu(conv_out)
+    with profile("ssm.conv"):
+        # Transpose qkv_mixed to [B, conv_ch, T] for conv.
+        qkv_bt = qkv_mixed.transpose(1, 2).contiguous()        # [B, conv_ch, T]
+        conv_in = torch.cat([conv_state, qkv_bt], dim=-1)      # [B, conv_ch, T + k-1]
+        w_conv = layer.conv1d.unsqueeze(1)                      # [conv_ch, 1, conv_k]
+        conv_out = F.conv1d(conv_in, w_conv, groups=conv_ch)    # [B, conv_ch, T]
+        # Update conv_state: last (conv_k - 1) columns of conv_in.
+        new_conv_state = conv_in[..., -(conv_k - 1):].contiguous()
+        conv_out = F.silu(conv_out)
 
-    # Back to [B, T, conv_ch].
-    conv_out = conv_out.transpose(1, 2).contiguous()        # [B, T, 8192]
+        # Back to [B, T, conv_ch].
+        conv_out = conv_out.transpose(1, 2).contiguous()        # [B, T, 8192]
 
-    # --- Split into q, k, v --------------------------------------------------
-    q = conv_out[..., :Ck].view(B, T, Hk, Sk)               # [B, T, Hk, Sk]
-    k = conv_out[..., Ck:2 * Ck].view(B, T, Hk, Sk)
-    v = conv_out[..., 2 * Ck:].view(B, T, Hv, Sv)           # [B, T, Hv, Sv]
+    with profile("ssm.recurrence"):
+        # --- Split into q, k, v --------------------------------------------------
+        q = conv_out[..., :Ck].view(B, T, Hk, Sk)               # [B, T, Hk, Sk]
+        k = conv_out[..., Ck:2 * Ck].view(B, T, Hk, Sk)
+        v = conv_out[..., 2 * Ck:].view(B, T, Hv, Sv)           # [B, T, Hv, Sv]
 
-    # L2-normalize q, k per-head.
-    q = _l2_norm(q, cfg.rms_eps)
-    k = _l2_norm(k, cfg.rms_eps)
+        # L2-normalize q, k per-head.
+        q = _l2_norm(q, cfg.rms_eps)
+        k = _l2_norm(k, cfg.rms_eps)
 
-    # Broadcast K heads to V heads (Hk -> Hv, repeat factor `rep`). llama.cpp
-    # uses ggml_repeat_4d here, which produces a *tile* pattern
-    # [h0, h1, ..., h15, h0, h1, ..., h15] — so V head i pairs with K head
-    # (i mod Hk). Use torch .repeat (tile), not .repeat_interleave (block).
-    q = q.repeat(1, 1, rep, 1)                              # [B, T, Hv, Sk]
-    k = k.repeat(1, 1, rep, 1)
+        # Broadcast K heads to V heads (Hk -> Hv, repeat factor `rep`). llama.cpp
+        # uses ggml_repeat_4d here, which produces a *tile* pattern
+        # [h0, h1, ..., h15, h0, h1, ..., h15] — so V head i pairs with K head
+        # (i mod Hk). Use torch .repeat (tile), not .repeat_interleave (block).
+        q = q.repeat(1, 1, rep, 1)                              # [B, T, Hv, Sk]
+        k = k.repeat(1, 1, rep, 1)
 
-    # --- DeltaNet recurrence (autoregressive loop) ---------------------------
-    # scale q by 1/sqrt(Sk) up-front (build_delta_net scales q).
-    scale = 1.0 / (Sk ** 0.5)
-    q = q * scale
+        # --- DeltaNet recurrence (autoregressive loop) ---------------------------
+        # scale q by 1/sqrt(Sk) up-front (build_delta_net scales q).
+        scale = 1.0 / (Sk ** 0.5)
+        q = q * scale
 
-    S = rec_state                                            # [B, Hv, Sk, Sv]
-    outs = []
-    for t in range(T):
-        qt = q[:, t]                                         # [B, Hv, Sk]
-        kt = k[:, t]
-        vt = v[:, t]                                         # [B, Hv, Sv]
-        gt = g[:, t]                                         # [B, Hv]
-        bt = beta[:, t]                                      # [B, Hv]
+        S = rec_state                                            # [B, Hv, Sk, Sv]
+        outs = []
+        for t in range(T):
+            qt = q[:, t]                                         # [B, Hv, Sk]
+            kt = k[:, t]
+            vt = v[:, t]                                         # [B, Hv, Sv]
+            gt = g[:, t]                                         # [B, Hv]
+            bt = beta[:, t]                                      # [B, Hv]
 
-        # Decay state.
-        S = S * torch.exp(gt)[..., None, None]
+            # Decay state.
+            S = S * torch.exp(gt)[..., None, None]
 
-        # Delta rule: d = (v - S^T·k) * β; S += k ⊗ d.
-        #   S: [B, Hv, Sk, Sv],  k: [B, Hv, Sk] → S^T·k is [B, Hv, Sv].
-        sk = torch.einsum("bhkv,bhk->bhv", S, kt)
-        d = (vt - sk) * bt[..., None]                        # [B, Hv, Sv]
-        S = S + torch.einsum("bhk,bhv->bhkv", kt, d)
+            # Delta rule: d = (v - S^T·k) * β; S += k ⊗ d.
+            #   S: [B, Hv, Sk, Sv],  k: [B, Hv, Sk] → S^T·k is [B, Hv, Sv].
+            sk = torch.einsum("bhkv,bhk->bhv", S, kt)
+            d = (vt - sk) * bt[..., None]                        # [B, Hv, Sv]
+            S = S + torch.einsum("bhk,bhv->bhkv", kt, d)
 
-        # Output o = S^T · q.
-        ot = torch.einsum("bhkv,bhk->bhv", S, qt)            # [B, Hv, Sv]
-        outs.append(ot)
+            # Output o = S^T · q.
+            ot = torch.einsum("bhkv,bhk->bhv", S, qt)            # [B, Hv, Sv]
+            outs.append(ot)
 
-    o = torch.stack(outs, dim=1)                             # [B, T, Hv, Sv]
+        o = torch.stack(outs, dim=1)                             # [B, T, Hv, Sv]
 
-    # --- Gated norm: rmsnorm(o, ssm_norm) * silu(z) -------------------------
-    # ssm_norm applies over the last dim (Sv=128) per head.
-    o = rms_norm(o, layer.ssm_norm, cfg.rms_eps)             # [B, T, Hv, Sv]
-    o = o.reshape(B, T, Hv * Sv)                             # [B, T, 4096]
-    o = o * F.silu(z)                                        # [B, T, 4096]
+    with profile("ssm.gated_norm"):
+        # --- Gated norm: rmsnorm(o, ssm_norm) * silu(z) -------------------------
+        # ssm_norm applies over the last dim (Sv=128) per head.
+        o = rms_norm(o, layer.ssm_norm, cfg.rms_eps)             # [B, T, Hv, Sv]
+        o = o.reshape(B, T, Hv * Sv)                             # [B, T, 4096]
+        o = o * F.silu(z)                                        # [B, T, 4096]
 
     # --- Output projection ---------------------------------------------------
-    if npu_ssm:
-        out = layer.npu["w_out"](o.reshape(-1)).reshape(1, 1, D)
-    else:
-        out = F.linear(o, layer.w_out)                       # [B, T, D]
+    with profile("ssm.out_proj"):
+        if npu_ssm:
+            out = layer.npu["w_out"](o.reshape(-1)).reshape(1, 1, D)
+        else:
+            out = F.linear(o, layer.w_out)                       # [B, T, D]
 
     return out, (new_conv_state, S)
 
@@ -549,32 +569,35 @@ def moe_forward(x: torch.Tensor, layer: MoELayer, cfg: Config) -> torch.Tensor:
         and "sh_gate" in layer.npu
         and x_flat.shape[0] == 1
     )
-    if npu_sh_mlp:
-        shared_out = layer.npu["sh_mlp"](x_flat)             # [1, D]
-    else:
-        if npu_shexp_split:
-            sh_gate = layer.npu["sh_gate"](x_flat)
-            sh_up = layer.npu["sh_up"](x_flat)
+    with profile("moe.shared"):
+        if npu_sh_mlp:
+            shared_out = layer.npu["sh_mlp"](x_flat)             # [1, D]
         else:
-            sh_gate = F.linear(x_flat, layer.w_gate_sh)
-            sh_up = F.linear(x_flat, layer.w_up_sh)
-        sh = F.silu(sh_gate) * sh_up
-        if npu_shexp_split:
-            shared_out = layer.npu["sh_down"](sh)            # [1, D]
-        else:
-            shared_out = F.linear(sh, layer.w_down_sh)       # [BT, D]
-    shared_scalar_gate = torch.sigmoid(x_flat @ layer.w_gate_inp_sh)  # [BT]
-    shared_out = shared_out * shared_scalar_gate.unsqueeze(-1)
+            if npu_shexp_split:
+                sh_gate = layer.npu["sh_gate"](x_flat)
+                sh_up = layer.npu["sh_up"](x_flat)
+            else:
+                sh_gate = F.linear(x_flat, layer.w_gate_sh)
+                sh_up = F.linear(x_flat, layer.w_up_sh)
+            sh = F.silu(sh_gate) * sh_up
+            if npu_shexp_split:
+                shared_out = layer.npu["sh_down"](sh)            # [1, D]
+            else:
+                shared_out = F.linear(sh, layer.w_down_sh)       # [BT, D]
+        shared_scalar_gate = torch.sigmoid(x_flat @ layer.w_gate_inp_sh)  # [BT]
+        shared_out = shared_out * shared_scalar_gate.unsqueeze(-1)
 
     # --- Routed experts. Match llama.cpp's qwen35moe ordering: softmax over
     # all E experts first, then top-K, then renormalize the top-K weights.
-    if layer.npu is not None and "router" in layer.npu and x_flat.shape[0] == 1:
-        router_logits = layer.npu["router"](x_flat)               # [1, E]
-    else:
-        router_logits = F.linear(x_flat, layer.w_router)          # [BT, E]
-    probs = F.softmax(router_logits.float(), dim=-1).to(x.dtype)  # [BT, E]
-    topk_vals, topk_ids = probs.topk(K, dim=-1)                   # [BT, K]
-    topk_w = topk_vals / topk_vals.sum(-1, keepdim=True).clamp_min(1e-20)
+    with profile("moe.router_topk"):
+        if layer.npu is not None and "router" in layer.npu and x_flat.shape[0] == 1:
+            router_logits = layer.npu["router"](x_flat)               # [1, E]
+        else:
+            router_logits = F.linear(x_flat, layer.w_router)          # [BT, E]
+        probs = F.softmax(router_logits.float(), dim=-1).to(x.dtype)  # [BT, E]
+        topk_vals, topk_ids = probs.topk(K, dim=-1)                   # [BT, K]
+        topk_w = topk_vals / topk_vals.sum(-1, keepdim=True).clamp_min(1e-20)
+        picked = torch.unique(topk_ids)
 
     out_routed = torch.zeros_like(x_flat)
     npu_experts = (
@@ -584,38 +607,48 @@ def moe_forward(x: torch.Tensor, layer: MoELayer, cfg: Config) -> torch.Tensor:
     )
     # Dequantize only the experts that at least one token picked. With T=1
     # that's exactly K=8; with longer prefills it stays bounded by min(K*T, E).
-    picked = torch.unique(topk_ids)
-    for e in picked.tolist():
-        mask = (topk_ids == e)
-        idx = mask.nonzero(as_tuple=False)
-        tok_idx = idx[:, 0]
-        slot_idx = idx[:, 1]
-        xe = x_flat[tok_idx]
-        we = topk_w[tok_idx, slot_idx]
+    with profile("moe.routed_loop"):
+        for e in picked.tolist():
+            mask = (topk_ids == e)
+            idx = mask.nonzero(as_tuple=False)
+            tok_idx = idx[:, 0]
+            slot_idx = idx[:, 1]
+            xe = x_flat[tok_idx]
+            we = topk_w[tok_idx, slot_idx]
 
-        if npu_experts:
-            expert = _npu_routed_expert(layer, int(e))
-            if len(expert) == 2:
-                gate_up_mv, down_mv = expert
-                gu = gate_up_mv(xe)
-                g, u = gu.split(cfg.d_expert_ff, dim=-1)
-                y = F.silu(g) * u
-                y = down_mv(y)
+            if npu_experts:
+                with profile("moe.expert.resolve"):
+                    expert = _npu_routed_expert(layer, int(e))
+                if len(expert) == 2:
+                    gate_up_mv, down_mv = expert
+                    with profile("moe.expert.gate_up"):
+                        gu = gate_up_mv(xe)
+                    with profile("moe.expert.act"):
+                        g, u = gu.split(cfg.d_expert_ff, dim=-1)
+                        y = F.silu(g) * u
+                    with profile("moe.expert.down"):
+                        y = down_mv(y)
+                else:
+                    gate_mv, up_mv, down_mv = expert
+                    with profile("moe.expert.gate_up"):
+                        g = gate_mv(xe)
+                        u = up_mv(xe)
+                    with profile("moe.expert.act"):
+                        y = F.silu(g) * u
+                    with profile("moe.expert.down"):
+                        y = down_mv(y)
             else:
-                gate_mv, up_mv, down_mv = expert
-                g = gate_mv(xe)
-                u = up_mv(xe)
-                y = F.silu(g) * u
-                y = down_mv(y)
-        else:
-            wg, wu, wd = layer.dequant_one(int(e))
-            g = F.linear(xe, wg)
-            u = F.linear(xe, wu)
-            y = F.silu(g) * u
-            y = F.linear(y, wd)
-            del wg, wu, wd
+                with profile("moe.expert.cpu_dequant"):
+                    wg, wu, wd = layer.dequant_one(int(e))
+                with profile("moe.expert.cpu_linear"):
+                    g = F.linear(xe, wg)
+                    u = F.linear(xe, wu)
+                    y = F.silu(g) * u
+                    y = F.linear(y, wd)
+                del wg, wu, wd
 
-        out_routed.index_add_(0, tok_idx, y * we.unsqueeze(-1))
+            with profile("moe.expert.accum"):
+                out_routed.index_add_(0, tok_idx, y * we.unsqueeze(-1))
 
     return (out_routed + shared_out).view(B, T, D)
 
@@ -799,8 +832,9 @@ def forward(
     if ssm_states is None:
         ssm_states = [None] * cfg.n_layer
 
-    tok = torch.tensor(tokens, dtype=torch.long).unsqueeze(0)  # [1, T]
-    x = F.embedding(tok, model.token_embd)                     # [1, T, D]
+    with profile("forward.embed"):
+        tok = torch.tensor(tokens, dtype=torch.long).unsqueeze(0)  # [1, T]
+        x = F.embedding(tok, model.token_embd)                     # [1, T, D]
     if trace:
         print(f"    emb: norm={x.float().norm().item():.3e}  "
               f"max={x.float().abs().max().item():.3e}")
@@ -809,23 +843,29 @@ def forward(
         core, moe = model.layers[i]
         kind = "attn" if cfg.is_attention[i] else "ssm "
         if cfg.is_attention[i]:
-            y, kv_caches[i] = attn_forward(
-                x, core, cfg, model.rope_cos, model.rope_sin,
-                kv_caches[i], start_pos,
-            )
+            with profile("forward.attn"):
+                y, kv_caches[i] = attn_forward(
+                    x, core, cfg, model.rope_cos, model.rope_sin,
+                    kv_caches[i], start_pos,
+                )
         else:
-            y, ssm_states[i] = ssm_forward(x, core, cfg, ssm_states[i])
+            with profile("forward.ssm"):
+                y, ssm_states[i] = ssm_forward(x, core, cfg, ssm_states[i])
         x = x + y
         if skip_moe:
             moe_out = torch.zeros_like(x)
         else:
-            moe_out = moe_forward(rms_norm(x, core.post_norm, cfg.rms_eps),
-                                  moe, cfg)
+            with profile("forward.moe_norm"):
+                moe_in = rms_norm(x, core.post_norm, cfg.rms_eps)
+            with profile("forward.moe"):
+                moe_out = moe_forward(moe_in, moe, cfg)
         x = x + moe_out
         if trace:
             print(f"    l{i:02d} {kind}: norm={x.float().norm().item():.3e}  "
                   f"max={x.float().abs().max().item():.3e}")
 
-    x = rms_norm(x, model.output_norm, cfg.rms_eps)
-    logits = F.linear(x, model.lm_head)                        # [1, T, vocab]
+    with profile("forward.out_norm"):
+        x = rms_norm(x, model.output_norm, cfg.rms_eps)
+    with profile("forward.lm_head"):
+        logits = F.linear(x, model.lm_head)                        # [1, T, vocab]
     return logits.squeeze(0), kv_caches, ssm_states
