@@ -46,7 +46,7 @@ def main() -> int:
                          "transparently falls back to F.linear.")
     ap.add_argument("--expert-cache-limit", type=int, default=None,
                     help="max routed experts cached per layer for NPU experts "
-                         "(default: 32 compact, 8 dense; -1 = unlimited)")
+                         "(default: 8; -1 = unlimited)")
     args = ap.parse_args()
 
     cache = Path(args.cache)

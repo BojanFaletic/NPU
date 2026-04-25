@@ -753,8 +753,8 @@ def enable_npu(
                     NPU matvec path. Higher memory and first-use cost, much
                     faster once the selected experts are cached.
 
-    Routed expert caches are per-layer LRU caches. By default compact experts
-    keep 32 experts/layer and dense experts keep 8 experts/layer; override with
+    Routed expert caches are per-layer LRU caches. By default compact and dense
+    experts keep 8 experts/layer; override with
     `expert_cache_limit` or QWEN_NPU_EXPERT_CACHE_LIMIT. A negative value or
     "unlimited" disables eviction.
 
@@ -797,7 +797,7 @@ def enable_npu(
             expert_dense = "experts_dense" in ops
             expert_fused = "experts" in ops and "experts_split" not in ops and not expert_dense
             if expert_cache_limit is None:
-                cache_limit = _expert_cache_limit_from_env(8 if expert_dense else 32)
+                cache_limit = _expert_cache_limit_from_env(8)
             else:
                 cache_limit = None if expert_cache_limit < 0 else expert_cache_limit
             moe.npu["expert_tensors"] = (
