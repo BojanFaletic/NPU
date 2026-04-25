@@ -194,10 +194,12 @@ class _XrtCtx:
 class NpuMatVec:
     """Single-vector F.linear(x, W) using a matrix-vector NPU program."""
 
-    def __init__(self, weight: torch.Tensor, n_cores: int = 8):
+    def __init__(self, weight: torch.Tensor, n_cores: int = 8,
+                 profile_prefix: str = "mv"):
         assert weight.dim() == 2
         self.out_features, self.in_features = weight.shape
         self.n_cores = n_cores
+        self.profile_prefix = profile_prefix
         self._compiled = build_xclbin(self.out_features, self.in_features, n_cores=n_cores)
         self._weight_src: torch.Tensor | None = weight
         self._W: torch.Tensor | None = None
@@ -242,22 +244,106 @@ class NpuMatVec:
             self._bo_x = pyxrt.bo(dev, self.in_features * 2, pyxrt.bo.host_only, kernel.group_id(4))
             self._bo_y = pyxrt.bo(dev, c.M * 4, pyxrt.bo.host_only, kernel.group_id(5))
 
-        with profile("mv.bf16"):
+        p = self.profile_prefix
+
+        with profile(f"{p}.bf16"):
             x_bf = x1.to(torch.bfloat16).contiguous()
             x_np = _bf16_to_u16(x_bf).reshape(-1)
-        with profile("mv.write"):
+        with profile(f"{p}.write"):
             self._bo_x.write(x_np.tobytes(), 0)
-        with profile("mv.sync_to"):
+        with profile(f"{p}.sync_to"):
             self._bo_x.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-        with profile("mv.kernel"):
+        with profile(f"{p}.kernel"):
             run = kernel(3, bo_instr, c.insts.size, self._bo_w, self._bo_x, self._bo_y)
             run.wait()
-        with profile("mv.sync_from"):
+        with profile(f"{p}.sync_from"):
             self._bo_y.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
-        with profile("mv.read"):
+        with profile(f"{p}.read"):
             y = np.frombuffer(bytes(self._bo_y.read(c.M * 4, 0)), dtype=np.float32)
             y = y[:self.out_features].copy()
-        with profile("mv.to_torch"):
+        with profile(f"{p}.to_torch"):
+            return torch.from_numpy(y).reshape(*x.shape[:-1], self.out_features)
+
+
+class NpuConcatMatVec:
+    """Single-vector F.linear(x, cat(weights, dim=0)) without materialising cat."""
+
+    def __init__(self, weights: tuple[torch.Tensor, ...], n_cores: int = 8,
+                 profile_prefix: str = "mv_concat"):
+        if not weights:
+            raise ValueError("weights must be non-empty")
+        for W in weights:
+            assert W.dim() == 2
+        in_features = weights[0].shape[1]
+        if any(W.shape[1] != in_features for W in weights):
+            raise ValueError("all weights must have the same input dimension")
+
+        self.out_splits = tuple(int(W.shape[0]) for W in weights)
+        self.out_features = sum(self.out_splits)
+        self.in_features = int(in_features)
+        self.n_cores = n_cores
+        self.profile_prefix = profile_prefix
+        self._compiled = build_xclbin(self.out_features, self.in_features, n_cores=n_cores)
+        self._weight_srcs: tuple[torch.Tensor, ...] | None = weights
+        self._bo_w: pyxrt.bo | None = None
+        self._bo_x: pyxrt.bo | None = None
+        self._bo_y: pyxrt.bo | None = None
+
+    def _stage_weights(self, dev: pyxrt.device, kernel: pyxrt.kernel) -> pyxrt.bo:
+        if self._weight_srcs is None:
+            raise RuntimeError("NPU source weights were already released")
+        c = self._compiled
+        bo_w = pyxrt.bo(dev, c.M * c.K * 2, pyxrt.bo.host_only, kernel.group_id(3))
+        offset = 0
+        for W in self._weight_srcs:
+            W_bf = W.to(torch.bfloat16).contiguous()
+            w_np = _bf16_to_u16(W_bf).reshape(-1)
+            bo_w.write(w_np.tobytes(), offset * 2)
+            offset += w_np.size
+        pad = c.M * c.K - offset
+        if pad:
+            bo_w.write(np.zeros(pad, dtype=np.uint16).tobytes(), offset * 2)
+        bo_w.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+        self._weight_srcs = None
+        return bo_w
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        try:
+            from npu.profiler import profile
+        except ModuleNotFoundError:
+            from profiler import profile
+
+        x1 = x.reshape(-1)
+        assert x1.numel() == self.in_features
+        c = self._compiled
+        dev = _XrtCtx.device()
+        _, _, kernel, bo_instr = _XrtCtx.kernel_for(c)
+
+        if self._bo_w is None:
+            self._bo_w = self._stage_weights(dev, kernel)
+
+        if self._bo_x is None:
+            self._bo_x = pyxrt.bo(dev, self.in_features * 2, pyxrt.bo.host_only, kernel.group_id(4))
+            self._bo_y = pyxrt.bo(dev, c.M * 4, pyxrt.bo.host_only, kernel.group_id(5))
+
+        p = self.profile_prefix
+
+        with profile(f"{p}.bf16"):
+            x_bf = x1.to(torch.bfloat16).contiguous()
+            x_np = _bf16_to_u16(x_bf).reshape(-1)
+        with profile(f"{p}.write"):
+            self._bo_x.write(x_np.tobytes(), 0)
+        with profile(f"{p}.sync_to"):
+            self._bo_x.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+        with profile(f"{p}.kernel"):
+            run = kernel(3, bo_instr, c.insts.size, self._bo_w, self._bo_x, self._bo_y)
+            run.wait()
+        with profile(f"{p}.sync_from"):
+            self._bo_y.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+        with profile(f"{p}.read"):
+            y = np.frombuffer(bytes(self._bo_y.read(c.M * 4, 0)), dtype=np.float32)
+            y = y[:self.out_features].copy()
+        with profile(f"{p}.to_torch"):
             return torch.from_numpy(y).reshape(*x.shape[:-1], self.out_features)
 
 

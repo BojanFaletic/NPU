@@ -109,7 +109,7 @@ class AttnLayer:
     wo: torch.Tensor                    # [D, n_head*head_dim]
     q_norm: torch.Tensor                # [head_dim]
     k_norm: torch.Tensor                # [head_dim]
-    # NPU dispatch handles for the wq / wk / wv / wo F.linear sites,
+    # NPU dispatch handles for the wqkv / wo F.linear sites,
     # populated by enable_npu(). Each entry is callable equivalent to
     # F.linear(x, W). T=1 path uses NpuMatVec; T>1 falls back to F.linear.
     npu: dict | None = None
@@ -152,14 +152,23 @@ def attn_forward(
     # is offset by n_embd_head within each slot.)
     npu_qkv = (
         layer.npu is not None
-        and "wq" in layer.npu
+        and ("wqkv" in layer.npu or "wq" in layer.npu)
         and B == 1 and T == 1
     )
     with profile("attn.qkv"):
         if npu_qkv:
-            q_full = layer.npu["wq"](h.reshape(-1)).reshape(1, 1, 2 * Hq * Dh)
-            k_raw = layer.npu["wk"](h.reshape(-1)).reshape(1, 1, Hkv * Dh)
-            v_raw = layer.npu["wv"](h.reshape(-1)).reshape(1, 1, Hkv * Dh)
+            if "wqkv" in layer.npu:
+                qkv = layer.npu["wqkv"](h.reshape(-1))
+                q_full, k_raw, v_raw = qkv.split(
+                    (2 * Hq * Dh, Hkv * Dh, Hkv * Dh), dim=-1,
+                )
+                q_full = q_full.reshape(1, 1, 2 * Hq * Dh)
+                k_raw = k_raw.reshape(1, 1, Hkv * Dh)
+                v_raw = v_raw.reshape(1, 1, Hkv * Dh)
+            else:
+                q_full = layer.npu["wq"](h.reshape(-1)).reshape(1, 1, 2 * Hq * Dh)
+                k_raw = layer.npu["wk"](h.reshape(-1)).reshape(1, 1, Hkv * Dh)
+                v_raw = layer.npu["wv"](h.reshape(-1)).reshape(1, 1, Hkv * Dh)
         else:
             q_full = F.linear(h, layer.wq)           # [B, T, 2*Hq*Dh]
             k_raw = F.linear(h, layer.wk)
@@ -726,8 +735,8 @@ def enable_npu(
         shexp_split — legacy shared expert gate/up/down as three dense
                     matvec dispatches per layer at T=1
         attn_o    — attention output proj (10 attn layers, [2048, 4096])
-        attn_qkv  — attention Q/K/V projections (10 attn layers; Q is
-                    [8192, 2048], K/V use shape [512, 2048])
+        attn_qkv  — fused attention Q/K/V projections (10 attn layers;
+                    [9216, 2048] = Q [8192, 2048] + K/V [512, 2048])
         ssm       — Gated DeltaNet in/gate/out (30 SSM layers; w_in shares
                     [8192, 2048] with attn wq, w_out shares [2048, 4096]
                     with attn_o, w_gate [4096, 2048] is new)
@@ -753,7 +762,7 @@ def enable_npu(
     Decode kernels are T=1-only; the dispatch path falls back to torch for T>1.
     """
     from npu.mlp import NpuFusedMLP
-    from npu.mv import NpuMatVec
+    from npu.mv import NpuConcatMatVec, NpuMatVec
 
     valid = {
         "router", "shexp", "shexp_split", "attn_o", "attn_qkv", "ssm",
@@ -807,12 +816,13 @@ def enable_npu(
                 core.npu = {}
             core.npu["wo"] = NpuMatVec(core.wo)
         if "attn_qkv" in ops and isinstance(core, AttnLayer):
-            # Q (8192, 2048) is new; K/V (512, 2048) share the shexp gate xclbin.
+            # One fused Q/K/V dispatch. The wrapper stages the three source
+            # tensors into one XRT buffer without materialising torch.cat.
             if core.npu is None:
                 core.npu = {}
-            core.npu["wq"] = NpuMatVec(core.wq)
-            core.npu["wk"] = NpuMatVec(core.wk)
-            core.npu["wv"] = NpuMatVec(core.wv)
+            core.npu["wqkv"] = NpuConcatMatVec(
+                (core.wq, core.wk, core.wv), profile_prefix="attn_qkv_mv",
+            )
         if "ssm" in ops and isinstance(core, SSMLayer):
             if core.npu is None:
                 core.npu = {}
