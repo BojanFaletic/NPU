@@ -40,9 +40,12 @@ def main() -> int:
                     help="debug: slice prompt to the first N tokens")
     ap.add_argument("--npu", default=None,
                     help="comma-sep ops to dispatch on the XDNA 2 NPU "
-                         "(router, shexp, experts, attn_o, attn_qkv, ssm). "
-                         "Each op is T=1 only; T>1 transparently falls back "
-                         "to F.linear.")
+                         "(router, shexp, experts, experts_dense, attn_o, "
+                         "attn_qkv, ssm). Each op is T=1 only; T>1 "
+                         "transparently falls back to F.linear.")
+    ap.add_argument("--expert-cache-limit", type=int, default=None,
+                    help="max routed experts cached per layer for NPU experts "
+                         "(default: 32 compact, 8 dense; -1 = unlimited)")
     args = ap.parse_args()
 
     cache = Path(args.cache)
@@ -68,7 +71,7 @@ def main() -> int:
     if args.npu:
         ops = tuple(s.strip() for s in args.npu.split(",") if s.strip())
         t0 = time.time()
-        enable_npu(model, ops=ops)
+        enable_npu(model, ops=ops, expert_cache_limit=args.expert_cache_limit)
         print(f"NPU enabled:  ops={ops}  ({time.time()-t0:.1f}s)")
 
     # --- Prefill ---

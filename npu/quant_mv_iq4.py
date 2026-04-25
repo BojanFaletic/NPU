@@ -280,7 +280,7 @@ class NpuIQ4MatVec:
             pad_rows = self._compiled.M - M
             zero_pad = np.zeros((pad_rows, row_bytes), dtype=np.uint8)
             packed = np.concatenate([packed, zero_pad], axis=0)
-        self._W = np.ascontiguousarray(packed)
+        self._W: np.ndarray | None = np.ascontiguousarray(packed)
 
         self._bo_w: pyxrt.bo | None = None
         self._bo_x: pyxrt.bo | None = None
@@ -319,10 +319,13 @@ class NpuIQ4MatVec:
         _, _, kernel, bo_instr = _XrtCtx.kernel_for(c)
 
         if self._bo_w is None:
+            if self._W is None:
+                raise RuntimeError("NPU weight staging buffer was already released")
             self._bo_w = pyxrt.bo(dev, self._W.nbytes, pyxrt.bo.host_only,
                                   kernel.group_id(3))
             self._bo_w.write(self._W.tobytes(), 0)
             self._bo_w.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            self._W = None
 
         if self._bo_x is None:
             self._bo_x = pyxrt.bo(dev, self.in_features * 2,

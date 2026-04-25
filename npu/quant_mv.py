@@ -186,7 +186,7 @@ class Compiled:
     insts: np.ndarray
 
 
-def build_xclbin(M: int, K: int, m: int = 128, n_cores: int = 4) -> Compiled:
+def build_xclbin(M: int, K: int, m: int = 64, n_cores: int = 8) -> Compiled:
     M_pad = ((M + m * n_cores - 1) // (m * n_cores)) * (m * n_cores)
     tag = f"qmv_{M_pad}x{K}_m{m}_c{n_cores}"
     build = CACHE / tag
@@ -336,7 +336,7 @@ class NpuQuantMatVec:
     """
 
     def __init__(self, packed_weight: np.ndarray, M: int, K: int,
-                 n_cores: int = 4, m: int | None = None):
+                 n_cores: int = 8, m: int | None = None):
         if packed_weight.dtype != np.uint8:
             raise TypeError(f"packed_weight must be uint8, got {packed_weight.dtype}")
         if K % BLK != 0:
@@ -352,7 +352,7 @@ class NpuQuantMatVec:
         self.in_features = K
         self.n_cores = n_cores
         if m is None:
-            m = 128 if M >= 512 else 32
+            m = 64 if M >= 512 and n_cores >= 8 else (128 if M >= 512 else 32)
         self._compiled = build_xclbin(M, K, m=m, n_cores=n_cores)
 
         # Pad rows to M_pad if needed.
@@ -362,7 +362,7 @@ class NpuQuantMatVec:
             pad_rows = self._compiled.M - M
             zero_pad = np.zeros((pad_rows, row_bytes), dtype=np.uint8)
             packed = np.concatenate([packed, zero_pad], axis=0)
-        self._W = np.ascontiguousarray(packed)
+        self._W: np.ndarray | None = np.ascontiguousarray(packed)
 
         self._bo_w: pyxrt.bo | None = None
         self._bo_x: pyxrt.bo | None = None
@@ -370,13 +370,13 @@ class NpuQuantMatVec:
 
     @classmethod
     def from_iq3_xxs_bytes(cls, packed: np.ndarray, M: int, K: int,
-                           n_cores: int = 4,
+                           n_cores: int = 8,
                            m: int | None = None) -> "NpuQuantMatVec":
         return cls(packed, M, K, n_cores=n_cores, m=m)
 
     @classmethod
     def from_gguf_tensor(cls, t, expert_idx: int | None = None,
-                         n_cores: int = 4,
+                         n_cores: int = 8,
                          m: int | None = None) -> "NpuQuantMatVec":
         if expert_idx is None:
             packed = repack_iq3_xxs_weight(t)
@@ -401,10 +401,13 @@ class NpuQuantMatVec:
         _, _, kernel, bo_instr = _XrtCtx.kernel_for(c)
 
         if self._bo_w is None:
+            if self._W is None:
+                raise RuntimeError("NPU weight staging buffer was already released")
             self._bo_w = pyxrt.bo(dev, self._W.nbytes, pyxrt.bo.host_only,
                                   kernel.group_id(3))
             self._bo_w.write(self._W.tobytes(), 0)
             self._bo_w.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            self._W = None
 
         if self._bo_x is None:
             self._bo_x = pyxrt.bo(dev, self.in_features * 2,

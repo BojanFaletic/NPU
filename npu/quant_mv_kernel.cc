@@ -71,13 +71,12 @@ void zero_f32_qmv(float *restrict c_out) {
 
 // Dequantizes one block of one row, accumulating one row's K-block contribution
 // into the returned partial sum.
-static inline float dequant_row_block_dot(const uint8_t *restrict blk,
-                                          const bfloat16 *restrict b_in) {
-  float d;
-  memcpy(&d, blk, 4);
+static inline float dequant_row_block_dot(
+    const uint8_t *restrict blk,
+    const aie::vector<bfloat16, 32> *restrict b_vecs) {
+  const float d = *(const float *)blk;
   const uint8_t *qs = blk + 4;
-  uint32_t scales[8];
-  memcpy(scales, blk + 68, 32);
+  const uint32_t *scales = (const uint32_t *)(blk + 68);
 
   aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
   for (int sb = 0; sb < 8; ++sb) {
@@ -89,8 +88,7 @@ static inline float dequant_row_block_dot(const uint8_t *restrict blk,
     set_dequant_group<1>(q_bf, sb_qs, sw, db);
     set_dequant_group<2>(q_bf, sb_qs, sw, db);
     set_dequant_group<3>(q_bf, sb_qs, sw, db);
-    const aie::vector<bfloat16, 32> b_v = aie::load_v<32>(b_in + sb * 32);
-    acc = aie::mac(acc, q_bf, b_v);
+    acc = aie::mac(acc, q_bf, b_vecs[sb]);
   }
   return aie::reduce_add(acc.to_vector<float>());
 }
@@ -103,9 +101,13 @@ void quant_mv_iq3_xxs_bf16_f32(uint8_t *restrict a_in,
                                bfloat16 *restrict b_in,
                                float *restrict c_out) {
   event0();
+  aie::vector<bfloat16, 32> b_vecs[8];
+  for (int sb = 0; sb < 8; ++sb) {
+    b_vecs[sb] = aie::load_v<32>(b_in + sb * 32);
+  }
   for (int row = 0; row < DIM_M; ++row) {
     const uint8_t *blk = a_in + row * B_BYTES;
-    c_out[row] += dequant_row_block_dot(blk, b_in);
+    c_out[row] += dequant_row_block_dot(blk, b_vecs);
   }
   event1();
 }

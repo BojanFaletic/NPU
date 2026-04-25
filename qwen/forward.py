@@ -16,6 +16,8 @@ Architecture (per inspect_gguf.py + gguf's qwen35moe tensor map):
 """
 from __future__ import annotations
 
+import os
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -468,13 +470,20 @@ def _npu_routed_expert(layer: MoELayer, expert_idx: int):
     cache = layer.npu["expert_cache"]
     cached = cache.get(expert_idx)
     if cached is not None:
+        if hasattr(cache, "move_to_end"):
+            cache.move_to_end(expert_idx)
         return cached
 
     from gguf import GGMLQuantizationType
+    from npu.mv import NpuMatVec
     from npu.quant_mv import NpuQuantMatVec
     from npu.quant_mv_iq4 import NpuIQ4MatVec
 
     def _make(t):
+        if layer.npu.get("expert_dense"):
+            w_np = layer.ts.get_expert(t.name, expert_idx)
+            w = torch.from_numpy(w_np.astype(np.float32, copy=True))
+            return NpuMatVec(w)
         qt = t.tensor_type
         if qt == GGMLQuantizationType.IQ3_XXS:
             return NpuQuantMatVec.from_gguf_tensor(t, expert_idx=expert_idx)
@@ -487,6 +496,11 @@ def _npu_routed_expert(layer: MoELayer, expert_idx: int):
     gate_t, up_t, down_t = layer.npu["expert_tensors"]
     cached = (_make(gate_t), _make(up_t), _make(down_t))
     cache[expert_idx] = cached
+    limit = layer.npu.get("expert_cache_limit")
+    if limit is not None:
+        while len(cache) > limit:
+            _, evicted = cache.popitem(last=False)
+            del evicted
     return cached
 
 
@@ -610,7 +624,23 @@ class Model:
                    layers=layers, rope_cos=cos, rope_sin=sin)
 
 
-def enable_npu(model: Model, ops: Sequence[str] = ("router",)) -> None:
+def _expert_cache_limit_from_env(default: int) -> int | None:
+    raw = os.environ.get("QWEN_NPU_EXPERT_CACHE_LIMIT")
+    if raw is None or raw == "":
+        return default
+    val = raw.strip().lower()
+    if val in {"none", "unlimited", "inf", "-1"}:
+        return None
+    limit = int(val)
+    return None if limit < 0 else limit
+
+
+def enable_npu(
+    model: Model,
+    ops: Sequence[str] = ("router",),
+    *,
+    expert_cache_limit: int | None = None,
+) -> None:
     """Wrap selected dense F.linear sites in NpuMatVec on the XDNA 2 NPU.
 
     Currently supported ops:
@@ -627,13 +657,25 @@ def enable_npu(model: Model, ops: Sequence[str] = ("router",)) -> None:
                     dequant+matvec; down uses the IQ4_XS bf16-expanded NPU
                     path. Experts are materialized lazily as routing selects
                     them.
+        experts_dense — routed MoE experts at T=1, but each selected expert
+                    is dequantized to bf16 once and then uses the fast dense
+                    NPU matvec path. Higher memory and first-use cost, much
+                    faster once the selected experts are cached.
+
+    Routed expert caches are per-layer LRU caches. By default compact experts
+    keep 32 experts/layer and dense experts keep 8 experts/layer; override with
+    `expert_cache_limit` or QWEN_NPU_EXPERT_CACHE_LIMIT. A negative value or
+    "unlimited" disables eviction.
 
     Each new (out, in) shape mints one xclbin (~30 s cold, cached after).
     NpuMatVec is T=1-only; the dispatch path falls back to F.linear for T>1.
     """
     from npu.mv import NpuMatVec
 
-    valid = {"router", "shexp", "attn_o", "attn_qkv", "ssm", "experts"}
+    valid = {
+        "router", "shexp", "attn_o", "attn_qkv", "ssm",
+        "experts", "experts_dense",
+    }
     unknown = set(ops) - valid
     if unknown:
         raise ValueError(f"unknown NPU ops: {sorted(unknown)} (valid: {sorted(valid)})")
@@ -649,14 +691,21 @@ def enable_npu(model: Model, ops: Sequence[str] = ("router",)) -> None:
             moe.npu["sh_gate"] = NpuMatVec(moe.w_gate_sh)
             moe.npu["sh_up"] = NpuMatVec(moe.w_up_sh)
             moe.npu["sh_down"] = NpuMatVec(moe.w_down_sh)
-        if "experts" in ops:
+        if "experts" in ops or "experts_dense" in ops:
             p = f"blk.{moe.i}."
+            expert_dense = "experts_dense" in ops
+            if expert_cache_limit is None:
+                cache_limit = _expert_cache_limit_from_env(8 if expert_dense else 32)
+            else:
+                cache_limit = None if expert_cache_limit < 0 else expert_cache_limit
             moe.npu["expert_tensors"] = (
                 moe.ts.raw(p + "ffn_gate_exps.weight"),
                 moe.ts.raw(p + "ffn_up_exps.weight"),
                 moe.ts.raw(p + "ffn_down_exps.weight"),
             )
-            moe.npu["expert_cache"] = {}
+            moe.npu["expert_cache"] = OrderedDict()
+            moe.npu["expert_dense"] = expert_dense
+            moe.npu["expert_cache_limit"] = cache_limit
         if "attn_o" in ops and isinstance(core, AttnLayer):
             # All 10 attention layers share shape (2048, 4096) → one xclbin.
             if core.npu is None:

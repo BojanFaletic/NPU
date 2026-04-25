@@ -134,7 +134,7 @@ class Compiled:
 
 
 def build_xclbin(M: int, K: int, m: int = 32, k: int = 64,
-                 n_cores: int = 4) -> Compiled:
+                 n_cores: int = 8) -> Compiled:
     M_pad = ((M + m * n_cores - 1) // (m * n_cores)) * (m * n_cores)
     tag = f"mv_{M_pad}x{K}_{m}x{k}_c{n_cores}"
     build = CACHE / tag
@@ -185,21 +185,28 @@ class _XrtCtx:
 class NpuMatVec:
     """Single-vector F.linear(x, W) using a matrix-vector NPU program."""
 
-    def __init__(self, weight: torch.Tensor, n_cores: int = 4):
+    def __init__(self, weight: torch.Tensor, n_cores: int = 8):
         assert weight.dim() == 2
         self.out_features, self.in_features = weight.shape
         self.n_cores = n_cores
         self._compiled = build_xclbin(self.out_features, self.in_features, n_cores=n_cores)
-        self._W = weight.to(torch.bfloat16).contiguous()
-        if self._compiled.M != self.out_features:
-            self._W = torch.cat([
-                self._W,
-                torch.zeros(self._compiled.M - self.out_features, self.in_features,
-                            dtype=torch.bfloat16),
-            ], dim=0).contiguous()
+        self._weight_src: torch.Tensor | None = weight
+        self._W: torch.Tensor | None = None
         self._bo_w: pyxrt.bo | None = None
         self._bo_x: pyxrt.bo | None = None
         self._bo_y: pyxrt.bo | None = None
+
+    def _stage_weight(self) -> torch.Tensor:
+        if self._weight_src is None:
+            raise RuntimeError("NPU source weight was already released")
+        W = self._weight_src.to(torch.bfloat16).contiguous()
+        if self._compiled.M != self.out_features:
+            W = torch.cat([
+                W,
+                torch.zeros(self._compiled.M - self.out_features, self.in_features,
+                            dtype=torch.bfloat16),
+            ], dim=0).contiguous()
+        return W
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         try:
@@ -214,10 +221,13 @@ class NpuMatVec:
         _, _, kernel, bo_instr = _XrtCtx.kernel_for(c)
 
         if self._bo_w is None:
-            w_np = _bf16_to_u16(self._W).reshape(-1)
+            W = self._stage_weight()
+            w_np = _bf16_to_u16(W).reshape(-1)
             self._bo_w = pyxrt.bo(dev, w_np.nbytes, pyxrt.bo.host_only, kernel.group_id(3))
             self._bo_w.write(w_np.tobytes(), 0)
             self._bo_w.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            self._weight_src = None
+            self._W = None
 
         if self._bo_x is None:
             self._bo_x = pyxrt.bo(dev, self.in_features * 2, pyxrt.bo.host_only, kernel.group_id(4))

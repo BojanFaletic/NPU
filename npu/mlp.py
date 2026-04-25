@@ -355,10 +355,10 @@ class NpuFusedMLP:
                     dtype=torch.bfloat16,
                 ),
             ], dim=0).contiguous()
-        self._Wgu = _pack_weight_for_split(
+        self._Wgu: torch.Tensor | None = _pack_weight_for_split(
             Wgu, self.ffn2, self.hidden, self._compiled.m, self._compiled.k, self.n_cores,
         )
-        self._Wdown = _pack_weight_for_split(
+        self._Wdown: torch.Tensor | None = _pack_weight_for_split(
             Wdown, self._compiled.down_m, self.ffn, self._compiled.m, self._compiled.k, self.n_cores,
         )
         self._bo_wgu: pyxrt.bo | None = None
@@ -380,6 +380,8 @@ class NpuFusedMLP:
         _, _, kernel, bo_instr = _XrtCtx.kernel_for(c)
 
         if self._bo_wgu is None:
+            if self._Wgu is None or self._Wdown is None:
+                raise RuntimeError("NPU weight staging buffers were already released")
             wgu_np = _bf16_to_u16(self._Wgu).reshape(-1)
             wdown_np = _bf16_to_u16(self._Wdown).reshape(-1)
             self._bo_wgu = pyxrt.bo(dev, wgu_np.nbytes, pyxrt.bo.host_only, kernel.group_id(3))
@@ -388,6 +390,8 @@ class NpuFusedMLP:
             self._bo_wdown.write(wdown_np.tobytes(), 0)
             self._bo_wgu.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
             self._bo_wdown.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            self._Wgu = None
+            self._Wdown = None
 
         if self._bo_xa is None:
             self._bo_xa = pyxrt.bo(dev, (self.hidden + self.ffn) * 2, pyxrt.bo.host_only, kernel.group_id(5))
