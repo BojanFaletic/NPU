@@ -5,11 +5,12 @@ It checks:
   - NPU generated token IDs and logits against a selectable baseline,
   - current and peak process RSS at major stages.
 
-Default baseline is the current Python CPU path. Use `--baseline llama` for the
-cached llama.cpp oracle from qwen/ref_cache. The llama check is margin-aware:
-near-tied top-1 disagreements are reported as ambiguous instead of structural
-failures, and logits after an ambiguous branch are not compared because the
-sequence context has diverged.
+Default baseline is the cached llama.cpp oracle from qwen/ref_cache, so normal
+benchmark runs skip the slow Python CPU pass. Use `--full-check` before larger
+model/NPU integrations to run the Python CPU baseline and require llama
+agreement too. The llama check is margin-aware: near-tied top-1 disagreements
+are reported as ambiguous instead of structural failures, and logits after an
+ambiguous branch are not compared because the sequence context has diverged.
 
 Run:
     PYTHONPATH=. uv run python qwen/test_npu_generate5.py
@@ -243,8 +244,9 @@ def main() -> int:
     ap.add_argument("--n-gen", type=int, default=5)
     ap.add_argument("--max-pos", type=int, default=512)
     ap.add_argument("--npu", default=DEFAULT_NPU_OPS)
-    ap.add_argument("--baseline", choices=("cpu", "llama"), default="cpu",
-                    help="baseline used for pass/fail checks")
+    ap.add_argument("--baseline", choices=("llama", "cpu"), default="llama",
+                    help="baseline used for pass/fail checks; default skips "
+                         "the slow Python CPU generation pass")
     ap.add_argument("--expert-cache-limit", type=int, default=None)
     ap.add_argument("--logit-cos-min", type=float, default=0.999)
     ap.add_argument("--max-logit-abs", type=float, default=None)
@@ -255,7 +257,13 @@ def main() -> int:
     ap.add_argument("--max-rss-gib", type=float, default=24.0)
     ap.add_argument("--require-oracle", action="store_true",
                     help="in --baseline cpu mode, also fail on llama.cpp drift")
+    ap.add_argument("--full-check", action="store_true",
+                    help="run the slower CPU baseline and require cached "
+                         "llama.cpp agreement")
     args = ap.parse_args()
+    if args.full_check:
+        args.baseline = "cpu"
+        args.require_oracle = True
 
     cache = Path(args.cache)
     prompt = np.load(cache / "prompt_tokens.npy").astype(np.int64).tolist()
@@ -264,6 +272,7 @@ def main() -> int:
     torch.set_grad_enabled(False)
     ok = True
 
+    t_all = time.time()
     mark("start")
     t0 = time.time()
     ts = TensorStore(args.model)
@@ -334,6 +343,7 @@ def main() -> int:
         f"memory peak={peak_gib:.2f} GiB "
         f"limit={args.max_rss_gib:.2f} GiB {'OK' if mem_ok else 'FAIL'}"
     )
+    print(f"total time={time.time() - t_all:.2f}s")
     return 0 if ok and mem_ok else 1
 
 
