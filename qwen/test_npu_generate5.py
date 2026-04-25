@@ -38,7 +38,7 @@ from qwen.model import TensorStore
 from npu.profiler import PROF, profile
 
 
-DEFAULT_NPU_OPS = "router,shexp,experts,attn_o,attn_qkv,ssm"
+DEFAULT_NPU_OPS = "router,shexp,experts,experts_packed_down,attn_o,attn_qkv,ssm"
 GGUF = ROOT / "qwen" / "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"
 CACHE = ROOT / "qwen" / "ref_cache"
 
