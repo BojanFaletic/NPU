@@ -477,8 +477,15 @@ def _npu_routed_expert(layer: MoELayer, expert_idx: int):
 
     from gguf import GGMLQuantizationType
     from npu.mv import NpuMatVec
-    from npu.quant_mv import NpuQuantMatVec
+    from npu.quant_mv import (
+        BLK as IQ3_BLK,
+        B_BYTES as IQ3_B_BYTES,
+        NpuQuantMatVec,
+        repack_iq3_xxs_per_expert,
+    )
     from npu.quant_mv_iq4 import NpuIQ4MatVec
+
+    gate_t, up_t, down_t = layer.npu["expert_tensors"]
 
     def _make(t):
         if layer.npu.get("expert_dense"):
@@ -494,8 +501,24 @@ def _npu_routed_expert(layer: MoELayer, expert_idx: int):
         w = torch.from_numpy(w_np.astype(np.float32, copy=False))
         return lambda x: F.linear(x, w)
 
-    gate_t, up_t, down_t = layer.npu["expert_tensors"]
-    cached = (_make(gate_t), _make(up_t), _make(down_t))
+    if (
+        layer.npu.get("expert_fused")
+        and not layer.npu.get("expert_dense")
+        and gate_t.tensor_type == GGMLQuantizationType.IQ3_XXS
+        and up_t.tensor_type == GGMLQuantizationType.IQ3_XXS
+    ):
+        K_in = int(gate_t.shape[0])
+        ffn = int(gate_t.shape[1])
+        row_bytes = (K_in // IQ3_BLK) * IQ3_B_BYTES
+        gate = repack_iq3_xxs_per_expert(gate_t, expert_idx).reshape(ffn, row_bytes)
+        up = repack_iq3_xxs_per_expert(up_t, expert_idx).reshape(ffn, row_bytes)
+        gate_up = np.ascontiguousarray(np.concatenate([gate, up], axis=0)).reshape(-1)
+        cached = (
+            NpuQuantMatVec.from_iq3_xxs_bytes(gate_up, 2 * ffn, K_in),
+            _make(down_t),
+        )
+    else:
+        cached = (_make(gate_t), _make(up_t), _make(down_t))
     cache[expert_idx] = cached
     limit = layer.npu.get("expert_cache_limit")
     if limit is not None:
@@ -571,11 +594,19 @@ def moe_forward(x: torch.Tensor, layer: MoELayer, cfg: Config) -> torch.Tensor:
         we = topk_w[tok_idx, slot_idx]
 
         if npu_experts:
-            gate_mv, up_mv, down_mv = _npu_routed_expert(layer, int(e))
-            g = gate_mv(xe)
-            u = up_mv(xe)
-            y = F.silu(g) * u
-            y = down_mv(y)
+            expert = _npu_routed_expert(layer, int(e))
+            if len(expert) == 2:
+                gate_up_mv, down_mv = expert
+                gu = gate_up_mv(xe)
+                g, u = gu.split(cfg.d_expert_ff, dim=-1)
+                y = F.silu(g) * u
+                y = down_mv(y)
+            else:
+                gate_mv, up_mv, down_mv = expert
+                g = gate_mv(xe)
+                u = up_mv(xe)
+                y = F.silu(g) * u
+                y = down_mv(y)
         else:
             wg, wu, wd = layer.dequant_one(int(e))
             g = F.linear(xe, wg)
@@ -664,10 +695,11 @@ def enable_npu(
         ssm       — Gated DeltaNet in/gate/out (30 SSM layers; w_in shares
                     [8192, 2048] with attn wq, w_out shares [2048, 4096]
                     with attn_o, w_gate [4096, 2048] is new)
-        experts   — routed MoE experts at T=1. Gate/up use IQ3_XXS NPU
-                    dequant+matvec; down uses the IQ4_XS bf16-expanded NPU
-                    path. Experts are materialized lazily as routing selects
-                    them.
+        experts   — routed MoE experts at T=1 with fused IQ3_XXS gate/up
+                    in one NPU dispatch, followed by the IQ4_XS down dispatch.
+        experts_split — legacy routed MoE experts at T=1 as separate gate/up/
+                    down NPU dispatches. Experts are materialized lazily as
+                    routing selects them.
         experts_dense — routed MoE experts at T=1, but each selected expert
                     is dequantized to bf16 once and then uses the fast dense
                     NPU matvec path. Higher memory and first-use cost, much
@@ -686,7 +718,7 @@ def enable_npu(
 
     valid = {
         "router", "shexp", "shexp_split", "attn_o", "attn_qkv", "ssm",
-        "experts", "experts_dense",
+        "experts", "experts_split", "experts_dense",
     }
     unknown = set(ops) - valid
     if unknown:
@@ -707,9 +739,10 @@ def enable_npu(
             moe.npu["sh_gate"] = NpuMatVec(moe.w_gate_sh)
             moe.npu["sh_up"] = NpuMatVec(moe.w_up_sh)
             moe.npu["sh_down"] = NpuMatVec(moe.w_down_sh)
-        if "experts" in ops or "experts_dense" in ops:
+        if "experts" in ops or "experts_split" in ops or "experts_dense" in ops:
             p = f"blk.{moe.i}."
             expert_dense = "experts_dense" in ops
+            expert_fused = "experts" in ops and "experts_split" not in ops and not expert_dense
             if expert_cache_limit is None:
                 cache_limit = _expert_cache_limit_from_env(8 if expert_dense else 32)
             else:
@@ -721,6 +754,7 @@ def enable_npu(
             )
             moe.npu["expert_cache"] = OrderedDict()
             moe.npu["expert_dense"] = expert_dense
+            moe.npu["expert_fused"] = expert_fused
             moe.npu["expert_cache_limit"] = cache_limit
         if "attn_o" in ops and isinstance(core, AttnLayer):
             # All 10 attention layers share shape (2048, 4096) → one xclbin.

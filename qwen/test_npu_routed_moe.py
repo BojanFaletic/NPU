@@ -1,8 +1,9 @@
 """Validate the T=1 routed MoE NPU path for one Qwen layer.
 
 This compares the normal CPU expert path against `moe_forward` with lazy NPU
-expert handles enabled. It exercises top-k routing, IQ3_XXS gate/up experts,
-IQ4_XS down experts, SwiGLU, route weighting, and the shared expert add.
+expert handles enabled. It exercises top-k routing, fused IQ3_XXS gate/up
+experts, SwiGLU, IQ4_XS down experts, route weighting, and the shared expert
+add.
 
 Run:
     uv run python qwen/test_npu_routed_moe.py
@@ -50,6 +51,9 @@ def main() -> int:
             ts.raw(p + "ffn_down_exps.weight"),
         ),
         "expert_cache": {},
+        "expert_fused": True,
+        "expert_dense": False,
+        "expert_cache_limit": None,
     }
 
     t0 = time.time()
@@ -66,7 +70,7 @@ def main() -> int:
     print(
         f"layer 0 routed MoE T=1\n"
         f"  cpu: {t_cpu*1000:.1f}ms   "
-        f"npu first/warm: {t_first*1000:.1f}/{t_warm*1000:.1f}ms   "
+        f"npu gateup-fused first/warm: {t_first*1000:.1f}/{t_warm*1000:.1f}ms   "
         f"cached experts={len(moe.npu['expert_cache'])}\n"
         f"  cos={c:.6f}  max|d|={max_err:.3e}  rel={rel_err:.3e}  "
         f"{'OK' if ok else 'FAIL'}"
