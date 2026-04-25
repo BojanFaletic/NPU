@@ -14,7 +14,9 @@ Per-row total bytes: K_blocks * 100, where K_blocks = K / 256.
 
 Constraints (today):
   - K must be a multiple of 256 (K_blocks > 0).
-  - M must be a multiple of `m * n_cores` (default 32 * 4 = 128).
+  - M is padded to a multiple of `m * n_cores`. The public wrapper picks
+    m=128 for Qwen-sized expert rows and m=32 for smaller matrices unless
+    overridden.
 """
 from __future__ import annotations
 
@@ -49,8 +51,6 @@ B_BYTES = 100      # bytes per block (host-preprocessed: fp32 d, 64 qs, 32 scale
 
 def _emit_tables_header() -> None:
     """Generate iq3_xxs_tables.h from the Python LUTs. Re-run if stale."""
-    if TABLES_HDR.exists():
-        return
     ksigns_fp = KSIGNS.astype(np.float32)
     lines: list[str] = [
         "// Auto-generated from npu/iq3_xxs.py — do not hand-edit.",
@@ -66,7 +66,9 @@ def _emit_tables_header() -> None:
     for r in ksigns_fp:
         lines.append("  " + ", ".join(f"{v:+.1f}f" for v in r) + ",")
     lines.append("};")
-    TABLES_HDR.write_text("\n".join(lines) + "\n")
+    text = "\n".join(lines) + "\n"
+    if not TABLES_HDR.exists() or TABLES_HDR.read_text() != text:
+        TABLES_HDR.write_text(text)
 
 
 def compile_kernel(m: int, build_dir: Path) -> Path:
@@ -136,7 +138,11 @@ def generate_mlir(M: int, K: int, m: int, n_cores: int,
             of_c.release(1)
 
     workers = [
-        Worker(core_fn, [fifo_a[i].cons(), fifo_b.cons(), fifo_c[i].prod(), zero, matvec])
+        Worker(
+            core_fn,
+            [fifo_a[i].cons(), fifo_b.cons(), fifo_c[i].prod(), zero, matvec],
+            stack_size=0x1000,
+        )
         for i in range(n_cores)
     ]
 
@@ -180,14 +186,16 @@ class Compiled:
     insts: np.ndarray
 
 
-def build_xclbin(M: int, K: int, m: int = 32, n_cores: int = 4) -> Compiled:
+def build_xclbin(M: int, K: int, m: int = 128, n_cores: int = 4) -> Compiled:
     M_pad = ((M + m * n_cores - 1) // (m * n_cores)) * (m * n_cores)
     tag = f"qmv_{M_pad}x{K}_m{m}_c{n_cores}"
     build = CACHE / tag
     build.mkdir(parents=True, exist_ok=True)
     xclbin = build / "final.xclbin"
     insts = build / "insts.bin"
-    src_mtime = max(KERNEL_SRC.stat().st_mtime,
+    src_mtime = max(Path(__file__).stat().st_mtime,
+                    (ROOT / "iq3_xxs.py").stat().st_mtime,
+                    KERNEL_SRC.stat().st_mtime,
                     TABLES_HDR.stat().st_mtime if TABLES_HDR.exists() else 0)
     stale = (
         not xclbin.exists()
@@ -328,7 +336,7 @@ class NpuQuantMatVec:
     """
 
     def __init__(self, packed_weight: np.ndarray, M: int, K: int,
-                 n_cores: int = 4):
+                 n_cores: int = 4, m: int | None = None):
         if packed_weight.dtype != np.uint8:
             raise TypeError(f"packed_weight must be uint8, got {packed_weight.dtype}")
         if K % BLK != 0:
@@ -343,7 +351,9 @@ class NpuQuantMatVec:
         self.out_features = M
         self.in_features = K
         self.n_cores = n_cores
-        self._compiled = build_xclbin(M, K, n_cores=n_cores)
+        if m is None:
+            m = 128 if M >= 512 else 32
+        self._compiled = build_xclbin(M, K, m=m, n_cores=n_cores)
 
         # Pad rows to M_pad if needed.
         row_bytes = K_blocks * B_BYTES
@@ -360,12 +370,14 @@ class NpuQuantMatVec:
 
     @classmethod
     def from_iq3_xxs_bytes(cls, packed: np.ndarray, M: int, K: int,
-                           n_cores: int = 4) -> "NpuQuantMatVec":
-        return cls(packed, M, K, n_cores=n_cores)
+                           n_cores: int = 4,
+                           m: int | None = None) -> "NpuQuantMatVec":
+        return cls(packed, M, K, n_cores=n_cores, m=m)
 
     @classmethod
     def from_gguf_tensor(cls, t, expert_idx: int | None = None,
-                         n_cores: int = 4) -> "NpuQuantMatVec":
+                         n_cores: int = 4,
+                         m: int | None = None) -> "NpuQuantMatVec":
         if expert_idx is None:
             packed = repack_iq3_xxs_weight(t)
             M = int(t.shape[1])
@@ -374,7 +386,7 @@ class NpuQuantMatVec:
             packed = repack_iq3_xxs_per_expert(t, expert_idx)
             M = int(t.shape[1])
             K = int(t.shape[0])
-        return cls(packed, M, K, n_cores=n_cores)
+        return cls(packed, M, K, n_cores=n_cores, m=m)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         try:

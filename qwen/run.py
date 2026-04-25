@@ -40,9 +40,9 @@ def main() -> int:
                     help="debug: slice prompt to the first N tokens")
     ap.add_argument("--npu", default=None,
                     help="comma-sep ops to dispatch on the XDNA 2 NPU "
-                         "(router, shexp, attn_o, attn_qkv, ssm). Each op "
-                         "is T=1 only; T>1 transparently falls back to "
-                         "F.linear.")
+                         "(router, shexp, experts, attn_o, attn_qkv, ssm). "
+                         "Each op is T=1 only; T>1 transparently falls back "
+                         "to F.linear.")
     args = ap.parse_args()
 
     cache = Path(args.cache)

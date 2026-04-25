@@ -459,6 +459,37 @@ class MoELayer:
         )
 
 
+def _npu_routed_expert(layer: MoELayer, expert_idx: int):
+    """Per-expert dispatch handles. Most tensors are IQ3_XXS (gate/up) or
+    IQ4_XS (down) and run on NPU. A few outliers in blk.1 / blk.34 are Q5_K /
+    Q6_K — for those we keep a per-expert CPU dequant + F.linear closure so
+    the routed path stays uniform from moe_forward's perspective.
+    """
+    cache = layer.npu["expert_cache"]
+    cached = cache.get(expert_idx)
+    if cached is not None:
+        return cached
+
+    from gguf import GGMLQuantizationType
+    from npu.quant_mv import NpuQuantMatVec
+    from npu.quant_mv_iq4 import NpuIQ4MatVec
+
+    def _make(t):
+        qt = t.tensor_type
+        if qt == GGMLQuantizationType.IQ3_XXS:
+            return NpuQuantMatVec.from_gguf_tensor(t, expert_idx=expert_idx)
+        if qt == GGMLQuantizationType.IQ4_XS:
+            return NpuIQ4MatVec.from_gguf_tensor(t, expert_idx=expert_idx)
+        w_np = layer.ts.get_expert(t.name, expert_idx)
+        w = torch.from_numpy(w_np.astype(np.float32, copy=False))
+        return lambda x: F.linear(x, w)
+
+    gate_t, up_t, down_t = layer.npu["expert_tensors"]
+    cached = (_make(gate_t), _make(up_t), _make(down_t))
+    cache[expert_idx] = cached
+    return cached
+
+
 def moe_forward(x: torch.Tensor, layer: MoELayer, cfg: Config) -> torch.Tensor:
     """x: [B, T, D]. Output [B, T, D]. Dequants the 3 expert tensors for this
     layer once per call (slow: ~7 s), drops them on return."""
@@ -500,6 +531,11 @@ def moe_forward(x: torch.Tensor, layer: MoELayer, cfg: Config) -> torch.Tensor:
     topk_w = topk_vals / topk_vals.sum(-1, keepdim=True).clamp_min(1e-20)
 
     out_routed = torch.zeros_like(x_flat)
+    npu_experts = (
+        layer.npu is not None
+        and "expert_tensors" in layer.npu
+        and x_flat.shape[0] == 1
+    )
     # Dequantize only the experts that at least one token picked. With T=1
     # that's exactly K=8; with longer prefills it stays bounded by min(K*T, E).
     picked = torch.unique(topk_ids)
@@ -511,12 +547,19 @@ def moe_forward(x: torch.Tensor, layer: MoELayer, cfg: Config) -> torch.Tensor:
         xe = x_flat[tok_idx]
         we = topk_w[tok_idx, slot_idx]
 
-        wg, wu, wd = layer.dequant_one(int(e))
-        g = F.linear(xe, wg)
-        u = F.linear(xe, wu)
-        y = F.silu(g) * u
-        y = F.linear(y, wd)
-        del wg, wu, wd
+        if npu_experts:
+            gate_mv, up_mv, down_mv = _npu_routed_expert(layer, int(e))
+            g = gate_mv(xe)
+            u = up_mv(xe)
+            y = F.silu(g) * u
+            y = down_mv(y)
+        else:
+            wg, wu, wd = layer.dequant_one(int(e))
+            g = F.linear(xe, wg)
+            u = F.linear(xe, wu)
+            y = F.silu(g) * u
+            y = F.linear(y, wd)
+            del wg, wu, wd
 
         out_routed.index_add_(0, tok_idx, y * we.unsqueeze(-1))
 
@@ -580,13 +623,17 @@ def enable_npu(model: Model, ops: Sequence[str] = ("router",)) -> None:
         ssm       — Gated DeltaNet in/gate/out (30 SSM layers; w_in shares
                     [8192, 2048] with attn wq, w_out shares [2048, 4096]
                     with attn_o, w_gate [4096, 2048] is new)
+        experts   — routed MoE experts at T=1. Gate/up use IQ3_XXS NPU
+                    dequant+matvec; down uses the IQ4_XS bf16-expanded NPU
+                    path. Experts are materialized lazily as routing selects
+                    them.
 
     Each new (out, in) shape mints one xclbin (~30 s cold, cached after).
     NpuMatVec is T=1-only; the dispatch path falls back to F.linear for T>1.
     """
     from npu.mv import NpuMatVec
 
-    valid = {"router", "shexp", "attn_o", "attn_qkv", "ssm"}
+    valid = {"router", "shexp", "attn_o", "attn_qkv", "ssm", "experts"}
     unknown = set(ops) - valid
     if unknown:
         raise ValueError(f"unknown NPU ops: {sorted(unknown)} (valid: {sorted(valid)})")
@@ -602,6 +649,14 @@ def enable_npu(model: Model, ops: Sequence[str] = ("router",)) -> None:
             moe.npu["sh_gate"] = NpuMatVec(moe.w_gate_sh)
             moe.npu["sh_up"] = NpuMatVec(moe.w_up_sh)
             moe.npu["sh_down"] = NpuMatVec(moe.w_down_sh)
+        if "experts" in ops:
+            p = f"blk.{moe.i}."
+            moe.npu["expert_tensors"] = (
+                moe.ts.raw(p + "ffn_gate_exps.weight"),
+                moe.ts.raw(p + "ffn_up_exps.weight"),
+                moe.ts.raw(p + "ffn_down_exps.weight"),
+            )
+            moe.npu["expert_cache"] = {}
         if "attn_o" in ops and isinstance(core, AttnLayer):
             # All 10 attention layers share shape (2048, 4096) → one xclbin.
             if core.npu is None:

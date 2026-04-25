@@ -20,8 +20,10 @@ sys.path.insert(0, str(ROOT))
 
 from gguf import GGUFReader, GGMLQuantizationType
 from gguf.quants import IQ3_XXS as GGUF_IQ3
+from gguf.quants import IQ4_XS as GGUF_IQ4
 
-from npu.quant_mv import NpuQuantMatVec, repack_iq3_xxs_per_expert
+from npu.quant_mv import NpuQuantMatVec
+from npu.quant_mv_iq4 import NpuIQ4MatVec
 
 
 GGUF = ROOT / "qwen" / "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"
@@ -35,7 +37,12 @@ def cos(a: torch.Tensor, b: torch.Tensor) -> float:
 
 def cpu_dequant_then_linear(t, expert_idx: int, x: torch.Tensor) -> torch.Tensor:
     chunk = np.ascontiguousarray(t.data[expert_idx]).view(np.uint8)
-    full = GGUF_IQ3.dequantize_blocks(chunk.reshape(-1, 98))
+    if t.tensor_type == GGMLQuantizationType.IQ3_XXS:
+        full = GGUF_IQ3.dequantize_blocks(chunk.reshape(-1, 98))
+    elif t.tensor_type == GGMLQuantizationType.IQ4_XS:
+        full = GGUF_IQ4.dequantize_blocks(chunk.reshape(-1, 136))
+    else:
+        raise ValueError(f"unsupported quant type: {t.tensor_type.name}")
     M = int(t.shape[1])
     K = int(t.shape[0])
     W = torch.from_numpy(full.reshape(M, K).astype(np.float32))
@@ -59,7 +66,8 @@ def main() -> int:
     rc = 0
     for name, e in cases:
         t = by_name[name]
-        if t.tensor_type != GGMLQuantizationType.IQ3_XXS:
+        if t.tensor_type not in (GGMLQuantizationType.IQ3_XXS,
+                                 GGMLQuantizationType.IQ4_XS):
             print(f"\n{name} expert {e}: skipping ({t.tensor_type.name})")
             continue
         K = int(t.shape[0])
@@ -68,11 +76,17 @@ def main() -> int:
         ref = cpu_dequant_then_linear(t, e, x).reshape(-1)
 
         t0 = time.time()
-        mv = NpuQuantMatVec.from_gguf_tensor(t, expert_idx=e)
+        if t.tensor_type == GGMLQuantizationType.IQ3_XXS:
+            mv = NpuQuantMatVec.from_gguf_tensor(t, expert_idx=e)
+        else:
+            mv = NpuIQ4MatVec.from_gguf_tensor(t, expert_idx=e)
         t_build = time.time() - t0
         t0 = time.time()
         out = mv(x).reshape(-1)
-        t_dispatch = time.time() - t0
+        t_dispatch_first = time.time() - t0
+        t0 = time.time()
+        out = mv(x).reshape(-1)
+        t_dispatch_warm = time.time() - t0
 
         c = cos(out, ref)
         max_err = (out - ref).abs().max().item()
@@ -81,7 +95,9 @@ def main() -> int:
         rc |= 0 if ok else 1
         print(
             f"\n{name} expert {e}  M={M} K={K}\n"
-            f"  build/cache: {t_build:.1f}s   dispatch: {t_dispatch*1000:.1f}ms\n"
+            f"  build/cache: {t_build:.1f}s   "
+            f"dispatch first/warm: {t_dispatch_first*1000:.1f}/"
+            f"{t_dispatch_warm*1000:.1f}ms\n"
             f"  cos={c:.6f}  max|Δ|={max_err:.3e}  rel={rel_err:.3e}  "
             f"{'OK' if ok else 'FAIL'}"
         )

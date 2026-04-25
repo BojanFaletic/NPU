@@ -36,6 +36,33 @@
 // quant_mv.py emits into the build dir).
 #include "iq3_xxs_tables.h"
 
+// Builds one 8-lane IQ3 group with explicit vector ops, then inserts it into
+// the 32-lane sub-block consumed by the native bf16 MAC.
+template <int G>
+static inline void set_dequant_group(aie::vector<bfloat16, 32> &qv,
+                                     const uint8_t *restrict qs,
+                                     uint32_t sw,
+                                     float db) {
+  const uint32_t sign_idx = (sw >> (G * 7)) & 0x7F;
+  const float *signs = IQ3_XXS_KSIGNS_FP + sign_idx * 8;
+  const uint8_t qa = qs[G * 2];
+  const uint8_t qb = qs[G * 2 + 1];
+  const float *ga = IQ3_XXS_GRID + qa * 4;
+  const float *gb = IQ3_XXS_GRID + qb * 4;
+
+  const aie::vector<float, 8> signs_v = aie::load_v<8>(signs);
+  const aie::vector<float, 4> ga_v = aie::load_v<4>(ga);
+  const aie::vector<float, 4> gb_v = aie::load_v<4>(gb);
+  aie::vector<float, 8> grid_v;
+  grid_v.insert(0, ga_v);
+  grid_v.insert(1, gb_v);
+  const aie::vector<float, 8> sg =
+      aie::mul(signs_v, grid_v).to_vector<float>();
+  const aie::vector<float, 8> db_v = aie::broadcast<float, 8>(db);
+  const aie::accum<accfloat, 8> q_acc = aie::mul(sg, db_v);
+  qv.insert(G, q_acc.to_vector<bfloat16>());
+}
+
 extern "C" {
 
 void zero_f32_qmv(float *restrict c_out) {
@@ -52,29 +79,20 @@ static inline float dequant_row_block_dot(const uint8_t *restrict blk,
   uint32_t scales[8];
   memcpy(scales, blk + 68, 32);
 
-  float sum = 0.0f;
+  aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
   for (int sb = 0; sb < 8; ++sb) {
     const uint32_t sw = scales[sb];
     const float db = d * (0.5f + (float)((sw >> 28) & 0xF)) * 0.5f;
-    for (int g = 0; g < 4; ++g) {
-      const uint32_t sign_idx = (sw >> (g * 7)) & 0x7F;
-      const float *signs = IQ3_XXS_KSIGNS_FP + sign_idx * 8;
-      const uint8_t qa = qs[sb * 8 + g * 2];
-      const uint8_t qb = qs[sb * 8 + g * 2 + 1];
-      const float *ga = IQ3_XXS_GRID + qa * 4;
-      const float *gb = IQ3_XXS_GRID + qb * 4;
-      const int lane0 = sb * 32 + g * 8;
-      sum += db * signs[0] * ga[0] * (float)b_in[lane0 + 0];
-      sum += db * signs[1] * ga[1] * (float)b_in[lane0 + 1];
-      sum += db * signs[2] * ga[2] * (float)b_in[lane0 + 2];
-      sum += db * signs[3] * ga[3] * (float)b_in[lane0 + 3];
-      sum += db * signs[4] * gb[0] * (float)b_in[lane0 + 4];
-      sum += db * signs[5] * gb[1] * (float)b_in[lane0 + 5];
-      sum += db * signs[6] * gb[2] * (float)b_in[lane0 + 6];
-      sum += db * signs[7] * gb[3] * (float)b_in[lane0 + 7];
-    }
+    aie::vector<bfloat16, 32> q_bf;
+    const uint8_t *sb_qs = qs + sb * 8;
+    set_dequant_group<0>(q_bf, sb_qs, sw, db);
+    set_dequant_group<1>(q_bf, sb_qs, sw, db);
+    set_dequant_group<2>(q_bf, sb_qs, sw, db);
+    set_dequant_group<3>(q_bf, sb_qs, sw, db);
+    const aie::vector<bfloat16, 32> b_v = aie::load_v<32>(b_in + sb * 32);
+    acc = aie::mac(acc, q_bf, b_v);
   }
-  return sum;
+  return aie::reduce_add(acc.to_vector<float>());
 }
 
 // One-block matvec tile entry point. Inputs are sized for DIM_M rows × 1
