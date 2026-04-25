@@ -40,8 +40,8 @@ def main() -> int:
                     help="debug: slice prompt to the first N tokens")
     ap.add_argument("--npu", default=None,
                     help="comma-sep ops to dispatch on the XDNA 2 NPU "
-                         "(router, shexp, experts, experts_dense, attn_o, "
-                         "attn_qkv, ssm). Each op is T=1 only; T>1 "
+                         "(router, shexp, shexp_split, experts, experts_dense, "
+                         "attn_o, attn_qkv, ssm). Each op is T=1 only; T>1 "
                          "transparently falls back to F.linear.")
     ap.add_argument("--expert-cache-limit", type=int, default=None,
                     help="max routed experts cached per layer for NPU experts "

@@ -421,9 +421,10 @@ class MoELayer:
     w_up_sh: torch.Tensor | None = None
     w_down_sh: torch.Tensor | None = None          # [D, ff_sh]
     w_gate_inp_sh: torch.Tensor | None = None      # [D]
-    # NPU dispatch handles, populated by enable_npu(). Each entry is a callable
-    # equivalent to F.linear(x, W). T=1 path uses NpuMatVec; T>1 falls back to
-    # F.linear since NpuMatVec is single-vector only.
+    # NPU dispatch handles, populated by enable_npu(). Dense entries are
+    # callables equivalent to F.linear(x, W); "sh_mlp" is equivalent to the
+    # full shared expert MLP before its scalar gate. T=1 paths use the NPU;
+    # T>1 falls back to torch since the decode kernels are single-vector only.
     npu: dict | None = None
 
     @classmethod
@@ -515,22 +516,30 @@ def moe_forward(x: torch.Tensor, layer: MoELayer, cfg: Config) -> torch.Tensor:
     # --- Shared expert: SwiGLU followed by a *scalar* (per-token) sigmoid gate.
     # ffn_gate_inp_shexp is shape (D,): llama.cpp's build_lora_mm treats the
     # 1-D weight as a dot product, producing one gate value per token.
-    npu_shexp = (
+    npu_sh_mlp = (
+        layer.npu is not None
+        and "sh_mlp" in layer.npu
+        and x_flat.shape[0] == 1
+    )
+    npu_shexp_split = (
         layer.npu is not None
         and "sh_gate" in layer.npu
         and x_flat.shape[0] == 1
     )
-    if npu_shexp:
-        sh_gate = layer.npu["sh_gate"](x_flat)
-        sh_up = layer.npu["sh_up"](x_flat)
+    if npu_sh_mlp:
+        shared_out = layer.npu["sh_mlp"](x_flat)             # [1, D]
     else:
-        sh_gate = F.linear(x_flat, layer.w_gate_sh)
-        sh_up = F.linear(x_flat, layer.w_up_sh)
-    sh = F.silu(sh_gate) * sh_up
-    if npu_shexp:
-        shared_out = layer.npu["sh_down"](sh)               # [1, D]
-    else:
-        shared_out = F.linear(sh, layer.w_down_sh)          # [BT, D]
+        if npu_shexp_split:
+            sh_gate = layer.npu["sh_gate"](x_flat)
+            sh_up = layer.npu["sh_up"](x_flat)
+        else:
+            sh_gate = F.linear(x_flat, layer.w_gate_sh)
+            sh_up = F.linear(x_flat, layer.w_up_sh)
+        sh = F.silu(sh_gate) * sh_up
+        if npu_shexp_split:
+            shared_out = layer.npu["sh_down"](sh)            # [1, D]
+        else:
+            shared_out = F.linear(sh, layer.w_down_sh)       # [BT, D]
     shared_scalar_gate = torch.sigmoid(x_flat @ layer.w_gate_inp_sh)  # [BT]
     shared_out = shared_out * shared_scalar_gate.unsqueeze(-1)
 
@@ -645,11 +654,13 @@ def enable_npu(
 
     Currently supported ops:
         router    — MoE router (40 layers, [n_expert=256, D=2048])
-        shexp     — shared expert gate/up/down (40 layers; gate/up share
-                    shape [512, 2048], down is [2048, 512])
+        shexp     — fused shared expert gate/up/activation/down in one
+                    dispatch per layer at T=1
+        shexp_split — legacy shared expert gate/up/down as three dense
+                    matvec dispatches per layer at T=1
         attn_o    — attention output proj (10 attn layers, [2048, 4096])
         attn_qkv  — attention Q/K/V projections (10 attn layers; Q is
-                    [8192, 2048], K/V share [512, 2048] with shexp gate)
+                    [8192, 2048], K/V use shape [512, 2048])
         ssm       — Gated DeltaNet in/gate/out (30 SSM layers; w_in shares
                     [8192, 2048] with attn wq, w_out shares [2048, 4096]
                     with attn_o, w_gate [4096, 2048] is new)
@@ -668,12 +679,13 @@ def enable_npu(
     "unlimited" disables eviction.
 
     Each new (out, in) shape mints one xclbin (~30 s cold, cached after).
-    NpuMatVec is T=1-only; the dispatch path falls back to F.linear for T>1.
+    Decode kernels are T=1-only; the dispatch path falls back to torch for T>1.
     """
+    from npu.mlp import NpuFusedMLP
     from npu.mv import NpuMatVec
 
     valid = {
-        "router", "shexp", "attn_o", "attn_qkv", "ssm",
+        "router", "shexp", "shexp_split", "attn_o", "attn_qkv", "ssm",
         "experts", "experts_dense",
     }
     unknown = set(ops) - valid
@@ -687,6 +699,10 @@ def enable_npu(
             # All routers share shape [n_expert=256, D=2048] → one xclbin total.
             moe.npu["router"] = NpuMatVec(moe.w_router)
         if "shexp" in ops:
+            moe.npu["sh_mlp"] = NpuFusedMLP(
+                moe.w_gate_sh, moe.w_down_sh, w_up=moe.w_up_sh,
+            )
+        if "shexp_split" in ops:
             # gate/up share (512, 2048); down is (2048, 512). Two xclbins total.
             moe.npu["sh_gate"] = NpuMatVec(moe.w_gate_sh)
             moe.npu["sh_up"] = NpuMatVec(moe.w_up_sh)

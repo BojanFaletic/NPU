@@ -197,7 +197,7 @@ def compare_moe(ts: TensorStore, dump: Path, i: int,
     the XDNA 2 NPU; everything else stays on CPU. This validates the NPU
     dispatch directly against the oracle, not just transitively.
 
-    Supported entries: ``"router"``, ``"shexp"``.
+    Supported entries: ``"router"``, ``"shexp"``, ``"shexp_split"``.
     """
     cfg = ts.cfg
     label = f"  [npu {'+'.join(npu)}]" if npu else ""
@@ -206,11 +206,16 @@ def compare_moe(ts: TensorStore, dump: Path, i: int,
     cur = load_oracle(dump, f"attn_post_norm-{i}").reshape(1, -1)   # [1, D]
     moe = MoELayer.load(ts, i)
     if npu:
+        from npu.mlp import NpuFusedMLP
         from npu.mv import NpuMatVec
         moe.npu = {}
         if "router" in npu:
             moe.npu["router"] = NpuMatVec(moe.w_router)
         if "shexp" in npu:
+            moe.npu["sh_mlp"] = NpuFusedMLP(
+                moe.w_gate_sh, moe.w_down_sh, w_up=moe.w_up_sh,
+            )
+        if "shexp_split" in npu:
             moe.npu["sh_gate"] = NpuMatVec(moe.w_gate_sh)
             moe.npu["sh_up"] = NpuMatVec(moe.w_up_sh)
             moe.npu["sh_down"] = NpuMatVec(moe.w_down_sh)
@@ -259,15 +264,16 @@ def compare_moe(ts: TensorStore, dump: Path, i: int,
 
     # 6) Shared expert
     if "shexp" in npu:
+        sh_out = moe.npu["sh_mlp"](cur).reshape(-1)
+    elif "shexp_split" in npu:
         sh_g = moe.npu["sh_gate"](cur).reshape(-1)
         sh_u = moe.npu["sh_up"](cur).reshape(-1)
+        sh = F.silu(sh_g) * sh_u
+        sh_out = moe.npu["sh_down"](sh).reshape(-1)
     else:
         sh_g = F.linear(cur, moe.w_gate_sh).squeeze(0)
         sh_u = F.linear(cur, moe.w_up_sh).squeeze(0)
-    sh = F.silu(sh_g) * sh_u
-    if "shexp" in npu:
-        sh_out = moe.npu["sh_down"](sh).reshape(-1)
-    else:
+        sh = F.silu(sh_g) * sh_u
         sh_out = F.linear(sh, moe.w_down_sh)
     diff(f"ffn_shexp-{i}", sh_out, load_oracle(dump, f"ffn_shexp-{i}"))
 
@@ -306,8 +312,8 @@ def main() -> int:
                     help="how many layers to chain (default: all 40)")
     ap.add_argument("--npu", default=None,
                     help="comma-sep ops to route through XDNA 2 NpuMatVec "
-                         "instead of F.linear (router, shexp, attn_o, "
-                         "attn_qkv, ssm). router/shexp are MoE-side "
+                         "instead of F.linear (router, shexp, shexp_split, "
+                         "attn_o, attn_qkv, ssm). router/shexp are MoE-side "
                          "(--moe-layer); attn_o/attn_qkv/ssm are mixer-side "
                          "(--layers / default).")
     args = ap.parse_args()

@@ -336,16 +336,50 @@ class _XrtCtx:
 class NpuFusedMLP:
     """Single-token fused MLP using gate/up, activation, and down on the NPU."""
 
-    def __init__(self, w_gate_up: torch.Tensor, w_down: torch.Tensor, n_cores: int = 4):
+    def __init__(
+        self,
+        w_gate_up: torch.Tensor,
+        w_down: torch.Tensor,
+        n_cores: int = 4,
+        *,
+        w_up: torch.Tensor | None = None,
+    ):
         assert w_gate_up.dim() == 2 and w_down.dim() == 2
-        self.ffn2, self.hidden = w_gate_up.shape
+        if w_up is not None:
+            assert w_up.dim() == 2
+            assert w_gate_up.shape == w_up.shape
+            ffn, self.hidden = w_gate_up.shape
+            self.ffn2 = 2 * ffn
+        else:
+            self.ffn2, self.hidden = w_gate_up.shape
         self.hidden_out, self.ffn = w_down.shape
         assert self.ffn2 == 2 * self.ffn
         assert self.hidden_out == self.hidden
         self.n_cores = n_cores
         self._compiled = build_xclbin(self.hidden, self.ffn, n_cores=n_cores)
-        Wgu = w_gate_up.to(torch.bfloat16).contiguous()
-        Wdown = w_down.to(torch.bfloat16).contiguous()
+        self._w_gate_up_src: torch.Tensor | None = None if w_up is not None else w_gate_up
+        self._w_gate_src: torch.Tensor | None = w_gate_up if w_up is not None else None
+        self._w_up_src: torch.Tensor | None = w_up
+        self._w_down_src: torch.Tensor | None = w_down
+        self._bo_wgu: pyxrt.bo | None = None
+        self._bo_wdown: pyxrt.bo | None = None
+        self._bo_xa: pyxrt.bo | None = None
+        self._bo_tmp: pyxrt.bo | None = None
+        self._bo_y: pyxrt.bo | None = None
+
+    def _pack_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._w_down_src is None:
+            raise RuntimeError("NPU source weights were already released")
+        if self._w_gate_up_src is not None:
+            Wgu = self._w_gate_up_src.to(torch.bfloat16).contiguous()
+        else:
+            if self._w_gate_src is None or self._w_up_src is None:
+                raise RuntimeError("NPU source weights were already released")
+            Wgu = torch.cat([
+                self._w_gate_src.to(torch.bfloat16),
+                self._w_up_src.to(torch.bfloat16),
+            ], dim=0).contiguous()
+        Wdown = self._w_down_src.to(torch.bfloat16).contiguous()
         if self._compiled.down_m != self.hidden:
             Wdown = torch.cat([
                 Wdown,
@@ -355,17 +389,17 @@ class NpuFusedMLP:
                     dtype=torch.bfloat16,
                 ),
             ], dim=0).contiguous()
-        self._Wgu: torch.Tensor | None = _pack_weight_for_split(
+        Wgu_packed = _pack_weight_for_split(
             Wgu, self.ffn2, self.hidden, self._compiled.m, self._compiled.k, self.n_cores,
         )
-        self._Wdown: torch.Tensor | None = _pack_weight_for_split(
+        Wdown_packed = _pack_weight_for_split(
             Wdown, self._compiled.down_m, self.ffn, self._compiled.m, self._compiled.k, self.n_cores,
         )
-        self._bo_wgu: pyxrt.bo | None = None
-        self._bo_wdown: pyxrt.bo | None = None
-        self._bo_xa: pyxrt.bo | None = None
-        self._bo_tmp: pyxrt.bo | None = None
-        self._bo_y: pyxrt.bo | None = None
+        self._w_gate_up_src = None
+        self._w_gate_src = None
+        self._w_up_src = None
+        self._w_down_src = None
+        return Wgu_packed, Wdown_packed
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         try:
@@ -380,18 +414,15 @@ class NpuFusedMLP:
         _, _, kernel, bo_instr = _XrtCtx.kernel_for(c)
 
         if self._bo_wgu is None:
-            if self._Wgu is None or self._Wdown is None:
-                raise RuntimeError("NPU weight staging buffers were already released")
-            wgu_np = _bf16_to_u16(self._Wgu).reshape(-1)
-            wdown_np = _bf16_to_u16(self._Wdown).reshape(-1)
+            Wgu, Wdown = self._pack_weights()
+            wgu_np = _bf16_to_u16(Wgu).reshape(-1)
+            wdown_np = _bf16_to_u16(Wdown).reshape(-1)
             self._bo_wgu = pyxrt.bo(dev, wgu_np.nbytes, pyxrt.bo.host_only, kernel.group_id(3))
             self._bo_wdown = pyxrt.bo(dev, wdown_np.nbytes, pyxrt.bo.host_only, kernel.group_id(4))
             self._bo_wgu.write(wgu_np.tobytes(), 0)
             self._bo_wdown.write(wdown_np.tobytes(), 0)
             self._bo_wgu.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
             self._bo_wdown.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-            self._Wgu = None
-            self._Wdown = None
 
         if self._bo_xa is None:
             self._bo_xa = pyxrt.bo(dev, (self.hidden + self.ffn) * 2, pyxrt.bo.host_only, kernel.group_id(5))
