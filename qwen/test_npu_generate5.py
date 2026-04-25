@@ -273,6 +273,10 @@ def main() -> int:
     ap.add_argument("--full-check", action="store_true",
                     help="run the slower CPU baseline and require cached "
                          "llama.cpp agreement")
+    ap.add_argument("--warmup-npu-runs", type=int, default=0,
+                    help="run this many unchecked NPU generations before the "
+                         "measured NPU run; useful for separating steady-state "
+                         "decode from first-use expert/cache staging")
     ap.add_argument("--profile", nargs="?", choices=("decode", "all"),
                     const="decode", default=None,
                     help="print profiler timings; plain --profile reports "
@@ -329,6 +333,19 @@ def main() -> int:
             t0 = time.time()
             enable_npu(model, ops=ops, expert_cache_limit=args.expert_cache_limit)
             mark("enable_npu", t0)
+
+        if args.warmup_npu_runs > 0:
+            prof_enabled = PROF.enabled
+            if prof_enabled:
+                PROF.disable()
+            for i in range(args.warmup_npu_runs):
+                run_generate(f"warmup{i}", model, prompt, args.n_gen)
+                gc.collect()
+                mark(f"after_warmup{i}")
+            if prof_enabled:
+                PROF.reset()
+                PROF.enable()
+
         if args.profile:
             PROF.reset()
         npu = run_generate(
