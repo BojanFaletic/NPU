@@ -4,13 +4,12 @@ Wraps a quantized weight matrix as a callable equivalent to F.linear(x, W),
 where the weight is stored on-device as IQ3_XXS bytes and dequantized inside
 the AIE tile (4 KB GRID + 1 KB KSIGNS_FP LUTs in tile DM).
 
-Per-block layout (host-preprocessed): 100 bytes
-  [ 0: 4]   d (fp32; the on-disk fp16 d is widened to fp32 by the host)
-  [ 4:68]   qs[64]   uint8 grid indices into the 256-entry × 4-lane GRID
-  [68:100]  scales_signs[8]  uint32 — bits[31:28] = sub-block scale,
-                                       bits[27:0] = 4 × 7-bit sign indices
+Per-block layout (host-preprocessed): 128 bytes
+  [  0: 32] db[8]       fp32 per-32-lane sub-block scale
+  [ 32: 96] qs[64]      uint8 grid indices into the 256-entry × 4-lane GRID
+  [ 96:128] sign_idx[32] uint8 7-bit sign LUT indices (8 sub-blocks × 4)
 
-Per-row total bytes: K_blocks * 100, where K_blocks = K / 256.
+Per-row total bytes: K_blocks * 128, where K_blocks = K / 256.
 
 Constraints (today):
   - K must be a multiple of 256 (K_blocks > 0).
@@ -30,7 +29,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 from matmul import PEANO, MLIR_AIE, compile_xclbin, _bf16_to_u16
-from iq3_xxs import GRID, KSIGNS, dequant_rows
+from iq3_xxs import GRID, KSIGNS
 
 sys.path.insert(0, "/opt/xilinx/xrt/python")
 import pyxrt
@@ -43,7 +42,7 @@ TABLES_HDR = ROOT / "iq3_xxs_tables.h"
 _COMPILED_CACHE: dict[tuple[int, int, int, int], "Compiled"] = {}
 
 BLK = 256          # K elements per IQ3_XXS block
-B_BYTES = 100      # bytes per block (host-preprocessed: fp32 d, 64 qs, 32 scales)
+B_BYTES = 128      # bytes per block (host-preprocessed: db[8], 64 qs, 32 sign idx)
 
 
 # ---------------------------------------------------------------------------
@@ -224,13 +223,32 @@ def build_xclbin(M: int, K: int, m: int = 64, n_cores: int = 8) -> Compiled:
 # Host-side weight repacking: GGUF tensor → (M, row_bytes) uint8.
 # ---------------------------------------------------------------------------
 
+def _repack_iq3_xxs_raw(raw: np.ndarray, M: int, K: int) -> np.ndarray:
+    K_blocks = K // BLK
+    raw = np.ascontiguousarray(raw).view(np.uint8).reshape(M, K_blocks, 98)
+
+    d = raw[..., :2].view(np.float16).astype(np.float32).reshape(M, K_blocks, 1)
+    sw = np.ascontiguousarray(raw[..., 66:98]).view(np.uint32).reshape(M, K_blocks, 8)
+    scales = ((sw >> np.uint32(28)) & np.uint32(0x0F)).astype(np.float32)
+    db = d * (0.5 + scales) * 0.5
+
+    shifts = np.array([0, 7, 14, 21], dtype=np.uint32)
+    sign_idx = ((sw[..., None] >> shifts) & np.uint32(0x7F)).astype(np.uint8)
+
+    out = np.empty((M, K_blocks, B_BYTES), dtype=np.uint8)
+    out[..., :32] = db.astype(np.float32).view(np.uint8).reshape(M, K_blocks, 32)
+    out[..., 32:96] = raw[..., 2:66]
+    out[..., 96:128] = sign_idx.reshape(M, K_blocks, 32)
+    return out.reshape(M, K_blocks * B_BYTES)
+
+
 def repack_iq3_xxs_weight(t) -> np.ndarray:
     """Repack a GGUF IQ3_XXS tensor (shape (in, out) on disk; per-row 98-byte
-    blocks) into the kernel-friendly (M=out, K_blocks * 100) uint8 buffer.
+    blocks) into the kernel-friendly (M=out, K_blocks * 128) uint8 buffer.
 
     Notes:
-      - Per-block d is widened from fp16 to fp32 (2 → 4 bytes) so the kernel
-        doesn't have to materialize an fp16 cast.
+      - Per-sub-block db and sign LUT indices are precomputed so the tile
+        avoids scalar fp scale arithmetic and bit extraction in the hot loop.
       - The input weight tensor is GGML-row-major: the fast axis is `in` and
         each row's blocks are contiguous.
     """
@@ -248,17 +266,7 @@ def repack_iq3_xxs_weight(t) -> np.ndarray:
     K_blocks = in_dim // BLK
     row_bytes_98 = K_blocks * 98
     raw = raw.reshape(M, row_bytes_98)
-
-    # Per-block widen d (fp16 → fp32). New row_bytes = K_blocks * 100.
-    out = np.empty((M, K_blocks, B_BYTES), dtype=np.uint8)
-    blk_in = raw.reshape(M, K_blocks, 98)
-    # d (fp16, 2 bytes) → fp32 (4 bytes)
-    d_fp16 = blk_in[..., :2].view(np.float16)            # (M, K_blocks, 1)
-    d_fp32 = d_fp16.astype(np.float32)                   # (M, K_blocks, 1)
-    out[..., :4] = d_fp32.view(np.uint8).reshape(M, K_blocks, 4)
-    out[..., 4:68] = blk_in[..., 2:66]                   # qs
-    out[..., 68:100] = blk_in[..., 66:98]                # scales_signs
-    return out.reshape(M, K_blocks * B_BYTES)
+    return _repack_iq3_xxs_raw(raw, M, in_dim)
 
 
 def repack_iq3_xxs_per_expert(t, expert_idx: int) -> np.ndarray:
@@ -284,15 +292,27 @@ def repack_iq3_xxs_per_expert(t, expert_idx: int) -> np.ndarray:
     # gguf-py stores stacked data as t.data shape (n_expert, M_per_expert, bytes/row)
     raw = np.ascontiguousarray(t.data[expert_idx]).view(np.uint8)
     raw = raw.reshape(M, row_bytes_98)
-    blk_in = raw.reshape(M, K_blocks, 98)
+    return _repack_iq3_xxs_raw(raw, M, in_dim)
 
-    out = np.empty((M, K_blocks, B_BYTES), dtype=np.uint8)
-    d_fp16 = blk_in[..., :2].view(np.float16)
-    d_fp32 = d_fp16.astype(np.float32)
-    out[..., :4] = d_fp32.view(np.uint8).reshape(M, K_blocks, 4)
-    out[..., 4:68] = blk_in[..., 2:66]
-    out[..., 68:100] = blk_in[..., 66:98]
-    return out.reshape(M, K_blocks * B_BYTES)
+
+def _dequant_packed_iq3_xxs(packed: np.ndarray, M: int, K: int) -> np.ndarray:
+    K_blocks = K // BLK
+    packed_3d = np.ascontiguousarray(packed).reshape(M, K_blocks, B_BYTES)
+    db = packed_3d[..., :32].view(np.float32).reshape(M, K_blocks, 8)
+    qs = packed_3d[..., 32:96]
+    sign_idx = packed_3d[..., 96:128].reshape(M, K_blocks, 8, 4)
+
+    out = np.empty((M, K_blocks, BLK), dtype=np.float32)
+    for sb in range(8):
+        for g in range(4):
+            qa = qs[..., sb * 8 + g * 2]
+            qb = qs[..., sb * 8 + g * 2 + 1]
+            grid = np.concatenate([GRID[qa], GRID[qb]], axis=-1)
+            signs = KSIGNS[sign_idx[..., sb, g]].astype(np.float32)
+            vals = db[..., sb, None] * signs * grid
+            lane0 = sb * 32 + g * 8
+            out[..., lane0:lane0 + 8] = vals
+    return out.reshape(M, K)
 
 
 # ---------------------------------------------------------------------------
@@ -477,20 +497,10 @@ def _self_test() -> None:
     print(f"  M={M} K={in_dim} K_blocks={K_blocks}  packed bytes={packed.size} (expected {expected_bytes})")
     assert packed.size == expected_bytes
 
-    # Re-dequant from our packed format and compare against gguf-py.
-    # Repack back to original 98-byte form for dequant_rows compatibility.
-    packed_3d = packed.reshape(M, K_blocks, B_BYTES)
-    rebuilt_98 = np.empty((M, K_blocks, 98), dtype=np.uint8)
-    # Convert d back fp32 → fp16 (lossless for the original fp16 values)
-    d_fp32 = packed_3d[..., :4].view(np.float32).reshape(M, K_blocks, 1)
-    d_fp16 = d_fp32.astype(np.float16)
-    rebuilt_98[..., :2] = d_fp16.view(np.uint8).reshape(M, K_blocks, 2)
-    rebuilt_98[..., 2:66] = packed_3d[..., 4:68]
-    rebuilt_98[..., 66:98] = packed_3d[..., 68:100]
-    dr_ours = dequant_rows(rebuilt_98).reshape(-1)
+    dr_ours = _dequant_packed_iq3_xxs(packed, M, in_dim).reshape(-1)
     diff = np.abs(dr_ours - dr_full).max()
-    print(f"  repack round-trip max|Δ|={diff:.3e}")
-    assert diff == 0.0
+    print(f"  packed dequant max|Δ|={diff:.3e}")
+    assert diff < 1e-6
 
 
 if __name__ == "__main__":

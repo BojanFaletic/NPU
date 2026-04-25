@@ -3,11 +3,11 @@
 // Computes  c[m] += sum over the K_BLOCKS K-blocks of  W_dequant[m, k] * b[k]
 // where W is stored as IQ3_XXS bytes laid out per row, and b is bf16.
 //
-// Per-block byte layout (host-preprocessed: original fp16 d → fp32):
-//   [ 0: 4]   d (fp32)
-//   [ 4:68]   qs[64]   (uint8 grid indices into 256-entry LUT)
-//   [68:100]  scales_signs[8] (uint32) — 4-bit scale + 4×7-bit sign indices
-// Block covers BLK = 256 K-elements; B_BYTES = 100 bytes per block.
+// Per-block byte layout (host-preprocessed):
+//   [  0: 32] db[8]     (fp32 per 32-lane sub-block scale)
+//   [ 32: 96] qs[64]    (uint8 grid indices into 256-entry LUT)
+//   [ 96:128] signs[32] (uint8 7-bit sign LUT indices; 8 sub-blocks × 4 groups)
+// Block covers BLK = 256 K-elements; B_BYTES = 128 bytes per block.
 //
 // Constants (linked into the .o, placed in tile DM):
 //   GRID   : (256, 4) fp32 — abs values from grid_map after 8-level decode
@@ -30,7 +30,7 @@
 #endif
 
 #define BLK 256
-#define B_BYTES 100
+#define B_BYTES 128
 
 // Generated tables (4 KB grid + 1 KB ksigns; included from a header that
 // quant_mv.py emits into the build dir).
@@ -41,10 +41,9 @@
 template <int G>
 static inline void set_dequant_group(aie::vector<bfloat16, 32> &qv,
                                      const uint8_t *restrict qs,
-                                     uint32_t sw,
+                                     const uint8_t *restrict sign_idxs,
                                      float db) {
-  const uint32_t sign_idx = (sw >> (G * 7)) & 0x7F;
-  const float *signs = IQ3_XXS_KSIGNS_FP + sign_idx * 8;
+  const float *signs = IQ3_XXS_KSIGNS_FP + sign_idxs[G] * 8;
   const uint8_t qa = qs[G * 2];
   const uint8_t qb = qs[G * 2 + 1];
   const float *ga = IQ3_XXS_GRID + qa * 4;
@@ -74,20 +73,20 @@ void zero_f32_qmv(float *restrict c_out) {
 static inline float dequant_row_block_dot(
     const uint8_t *restrict blk,
     const aie::vector<bfloat16, 32> *restrict b_vecs) {
-  const float d = *(const float *)blk;
-  const uint8_t *qs = blk + 4;
-  const uint32_t *scales = (const uint32_t *)(blk + 68);
+  const uint8_t *qs = blk + 32;
+  const uint8_t *sign_idxs = blk + 96;
+  const float *dbs = (const float *)blk;
 
   aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
   for (int sb = 0; sb < 8; ++sb) {
-    const uint32_t sw = scales[sb];
-    const float db = d * (0.5f + (float)((sw >> 28) & 0xF)) * 0.5f;
+    const float db = dbs[sb];
     aie::vector<bfloat16, 32> q_bf;
     const uint8_t *sb_qs = qs + sb * 8;
-    set_dequant_group<0>(q_bf, sb_qs, sw, db);
-    set_dequant_group<1>(q_bf, sb_qs, sw, db);
-    set_dequant_group<2>(q_bf, sb_qs, sw, db);
-    set_dequant_group<3>(q_bf, sb_qs, sw, db);
+    const uint8_t *sb_sign_idxs = sign_idxs + sb * 4;
+    set_dequant_group<0>(q_bf, sb_qs, sb_sign_idxs, db);
+    set_dequant_group<1>(q_bf, sb_qs, sb_sign_idxs, db);
+    set_dequant_group<2>(q_bf, sb_qs, sb_sign_idxs, db);
+    set_dequant_group<3>(q_bf, sb_qs, sb_sign_idxs, db);
     acc = aie::mac(acc, q_bf, b_vecs[sb]);
   }
   return aie::reduce_add(acc.to_vector<float>());
